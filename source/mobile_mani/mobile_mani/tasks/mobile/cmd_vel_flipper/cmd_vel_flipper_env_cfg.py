@@ -151,7 +151,7 @@ def flipper_down_without_obstacle_l2(
     return torch.where(should_not_dig, downward_penalty, torch.zeros_like(downward_penalty))
 
 
-def flipper_cruise_clearance_l2(
+def flipper_cruise_clearance_exp(
     env: ManagerBasedRLEnv,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     front_sensor_cfg: SceneEntityCfg = SceneEntityCfg("height_scanner"),
@@ -163,8 +163,9 @@ def flipper_cruise_clearance_l2(
     command_threshold: float = 0.05,
     target_clearance: float = 0.03,
     deadband: float = 0.02,
+    std: float = 0.08,
 ) -> torch.Tensor:
-    """Keep front flipper tips lightly above the local support ground during cruise/idle."""
+    """Reward front flipper tips staying lightly above the local support ground during cruise/idle."""
     robot = env.scene[asset_cfg.name]
     front_sensor = env.scene.sensors[front_sensor_cfg.name]
     support_sensor = env.scene.sensors[support_sensor_cfg.name]
@@ -203,9 +204,10 @@ def flipper_cruise_clearance_l2(
     tip_clearance = front_flipper_tip_z_w(env, tip_frame_cfg) - support_ground_z
 
     clearance_error = torch.abs(tip_clearance - target_clearance)
-    clearance_penalty = torch.square(torch.clamp(clearance_error - deadband, min=0.0))
+    clearance_error = torch.clamp(clearance_error - deadband, min=0.0)
+    clearance_reward = torch.exp(-torch.square(clearance_error / std))
     cruise_or_idle = ~(obstacle_active & command_active)
-    return torch.where(cruise_or_idle, clearance_penalty, torch.zeros_like(clearance_penalty))
+    return torch.where(cruise_or_idle, clearance_reward, torch.zeros_like(clearance_reward))
 
 
 def excessive_pitch_l2(
@@ -710,7 +712,7 @@ class RewardsCfg:
     action_l2 = RewTerm(func=mdp.action_l2, weight=-0.02)
     excessive_flat_orientation = RewTerm(func=excessive_flat_orientation_l2, weight=-1.0)
     excessive_pitch = RewTerm(func=excessive_pitch_l2, weight=-1.0)
-    flipper_cruise_clearance = RewTerm(func=flipper_cruise_clearance_l2, weight=-5.0)
+    flipper_cruise_clearance = RewTerm(func=flipper_cruise_clearance_exp, weight=0.5)
     flipper_tip_obstacle_height = RewTerm(func=flipper_tip_obstacle_height_l1, weight=-1.0)
     termination = RewTerm(func=mdp.is_terminated, weight=-100.0)
 

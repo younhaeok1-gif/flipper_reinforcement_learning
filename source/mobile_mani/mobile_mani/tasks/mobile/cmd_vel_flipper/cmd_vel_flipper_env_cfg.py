@@ -15,7 +15,7 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.managers.action_manager import ActionTerm, ActionTermCfg
 from isaaclab.scene import InteractiveSceneCfg
-from isaaclab.sensors import FrameTransformerCfg, RayCasterCfg
+from isaaclab.sensors import ContactSensorCfg, FrameTransformerCfg, RayCasterCfg
 from isaaclab.sensors.ray_caster.patterns import GridPatternCfg
 from isaaclab.terrains import TerrainImporterCfg
 from isaaclab.terrains.config.rough import ROUGH_TERRAINS_CFG
@@ -219,6 +219,43 @@ def excessive_pitch_l2(
     robot = env.scene[asset_cfg.name]
     pitch_like_tilt = torch.abs(robot.data.projected_gravity_b[:, 0])
     return torch.square(torch.clamp(pitch_like_tilt - deadband, min=0.0))
+
+
+def flipper_distal_contact_pitch_l2(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("front_flipper_contacts"),
+    contact_force_threshold: float = 20.0,
+    contact_force_scale: float = 150.0,
+    pitch_deadband: float = 0.25,
+    max_roller_index: int = 9,
+) -> torch.Tensor:
+    """Penalize pitching up with contact load concentrated toward the front flipper tips."""
+    robot = env.scene[asset_cfg.name]
+    sensor = env.scene.sensors[sensor_cfg.name]
+
+    tip_force = torch.linalg.norm(sensor.data.net_forces_w, dim=-1)
+    tip_force = torch.nan_to_num(tip_force, nan=0.0, posinf=contact_force_threshold, neginf=0.0)
+
+    distal_weights = []
+    for body_name in sensor.body_names:
+        try:
+            roller_index = int(body_name.rsplit("_", 1)[-1])
+        except ValueError:
+            roller_index = max_roller_index
+        distal_weights.append((roller_index + 1) / (max_roller_index + 1))
+    distal_weights = torch.tensor(distal_weights, device=env.device).unsqueeze(0)
+    distal_contact_load = torch.sum(tip_force * distal_weights, dim=1)
+
+    pitch_like_tilt = torch.abs(robot.data.projected_gravity_b[:, 0])
+    pitch_penalty = torch.square(torch.clamp(pitch_like_tilt - pitch_deadband, min=0.0))
+    contact_active = distal_contact_load > contact_force_threshold
+    contact_load = 1.0 + torch.clamp(
+        (distal_contact_load - contact_force_threshold) / contact_force_scale,
+        min=0.0,
+        max=2.0,
+    )
+    return torch.where(contact_active, pitch_penalty * contact_load, torch.zeros_like(pitch_penalty))
 
 
 def base_orientation_stability_exp(
@@ -565,6 +602,12 @@ class CmdVelFlipperSceneCfg(InteractiveSceneCfg):
         ],
     )
 
+    front_flipper_contacts = ContactSensorCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/(ffl_roller_.*|ffr_roller_.*)",
+        history_length=3,
+        debug_vis=False,
+    )
+
     light: AssetBaseCfg = AssetBaseCfg(
         prim_path="/World/light",
         spawn=sim_utils.DomeLightCfg(intensity=2000.0),
@@ -727,6 +770,7 @@ class RewardsCfg:
     action_l2 = RewTerm(func=clamped_action_l2, weight=-0.02)
     excessive_flat_orientation = RewTerm(func=excessive_flat_orientation_l2, weight=-1.0)
     excessive_pitch = RewTerm(func=excessive_pitch_l2, weight=-1.0)
+    flipper_distal_contact_pitch = RewTerm(func=flipper_distal_contact_pitch_l2, weight=-5.0)
     flipper_cruise_clearance = RewTerm(func=flipper_cruise_clearance_exp, weight=0.5)
     termination = RewTerm(func=mdp.is_terminated, weight=-100.0)
 

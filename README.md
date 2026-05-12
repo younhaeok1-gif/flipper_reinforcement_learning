@@ -5,6 +5,9 @@
 This project/repository serves as a template for building projects or extensions based on Isaac Lab.
 It allows you to develop in an isolated environment, outside of the core Isaac Lab repository.
 
+Project-specific notes for the current mobile flipper RL task are in
+[`docs/cmd_vel_flipper_task_notes.md`](docs/cmd_vel_flipper_task_notes.md).
+
 **Key Features:**
 
 - `Isolation` Work outside the core Isaac Lab repository, ensuring that your development efforts remain self-contained.

@@ -94,7 +94,8 @@ Current active rewards in `RewardsCfg`:
 - `flipper_distal_contact_pitch`: stronger negative penalty when contact load is
   concentrated toward the front flipper tips while the body is pitched up.
 - `flipper_cruise_clearance`: positive reward for keeping front flipper tips near
-  target clearance during cruise/idle.
+  target clearance during cruise/idle, only while the tip rollers are not in
+  contact.
 - `flipper_tip_obstacle_height`: negative penalty for mismatch between tip height
   and estimated upcoming obstacle height.
 - `termination`: large negative penalty on termination.
@@ -124,6 +125,8 @@ It has been changed to praise good behavior:
 - function is now `flipper_cruise_clearance_exp`
 - it returns an exponential reward close to `1.0` when the front flipper tips are
   near `target_clearance`
+- it is active only when `ffl_roller_9` and `ffr_roller_9` contact force is below
+  `tip_contact_force_threshold`
 - it returns `0.0` when the robot is actively approaching an obstacle and should
   focus on obstacle handling instead of cruise posture
 - reward weight is positive

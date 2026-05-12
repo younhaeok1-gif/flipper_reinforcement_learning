@@ -158,18 +158,21 @@ def flipper_cruise_clearance_exp(
     front_sensor_cfg: SceneEntityCfg = SceneEntityCfg("height_scanner"),
     support_sensor_cfg: SceneEntityCfg = SceneEntityCfg("support_scanner"),
     tip_frame_cfg: SceneEntityCfg = SceneEntityCfg("flipper_tip_frames"),
+    contact_sensor_cfg: SceneEntityCfg = SceneEntityCfg("front_flipper_contacts"),
     obstacle_x_range: tuple[float, float] = (0.0, 0.9),
     obstacle_y_range: tuple[float, float] = (-0.5, 0.5),
     obstacle_threshold: float = 0.06,
     command_threshold: float = 0.05,
+    tip_contact_force_threshold: float = 5.0,
     target_clearance: float = 0.03,
     deadband: float = 0.02,
     std: float = 0.08,
 ) -> torch.Tensor:
-    """Reward front flipper tips staying lightly above the local support ground during cruise/idle."""
+    """Reward front flipper tips staying lightly above ground without touching during cruise/idle."""
     robot = env.scene[asset_cfg.name]
     front_sensor = env.scene.sensors[front_sensor_cfg.name]
     support_sensor = env.scene.sensors[support_sensor_cfg.name]
+    contact_sensor = env.scene.sensors[contact_sensor_cfg.name]
 
     points_w = front_sensor.data.ray_hits_w
     finite = torch.isfinite(points_w).all(dim=-1)
@@ -208,7 +211,22 @@ def flipper_cruise_clearance_exp(
     clearance_error = torch.clamp(clearance_error - deadband, min=0.0)
     clearance_reward = torch.exp(-torch.square(clearance_error / std))
     cruise_or_idle = ~(obstacle_active & command_active)
-    return torch.where(cruise_or_idle, clearance_reward, torch.zeros_like(clearance_reward))
+
+    tip_body_ids = [
+        body_id
+        for body_id, body_name in enumerate(contact_sensor.body_names)
+        if body_name in ("ffl_roller_9", "ffr_roller_9")
+    ]
+    if tip_body_ids:
+        tip_forces = torch.linalg.norm(contact_sensor.data.net_forces_w[:, tip_body_ids], dim=-1)
+        tip_forces = torch.nan_to_num(tip_forces, nan=0.0, posinf=tip_contact_force_threshold, neginf=0.0)
+        max_tip_force = torch.max(tip_forces, dim=1).values
+        tips_not_touching = max_tip_force <= tip_contact_force_threshold
+    else:
+        tips_not_touching = torch.ones(env.num_envs, dtype=torch.bool, device=env.device)
+
+    reward_active = cruise_or_idle & tips_not_touching
+    return torch.where(reward_active, clearance_reward, torch.zeros_like(clearance_reward))
 
 
 def excessive_pitch_l2(
@@ -866,5 +884,5 @@ class CmdVelFlipperEnvCfg(ManagerBasedRLEnvCfg):
     terminations: TerminationsCfg = TerminationsCfg()
     events: EventsCfg = EventsCfg()
 
-    command_lin_vel_range: tuple[float, float] = (0.0, 0.6)
+    command_lin_vel_range: tuple[float, float] = (0.0, 1.5)
     command_ang_vel_range: tuple[float, float] = (-0.4, 0.4)

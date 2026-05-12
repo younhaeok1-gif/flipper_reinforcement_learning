@@ -1,6 +1,7 @@
 import torch
 
 from dataclasses import MISSING
+from math import pi
 
 import isaaclab.envs.mdp as mdp
 import isaaclab.sim as sim_utils
@@ -618,10 +619,14 @@ class CmdVelFlipperSceneCfg(InteractiveSceneCfg):
 class CmdVelFrontFlipperActionCfg(ActionTermCfg):
     class_type = None
     asset_name: str = MISSING
+    action_mode: str = "stepped"
     flipper_joint_names: list[str] = MISSING
     left_drive_joint_expr: str = MISSING
     right_drive_joint_expr: str = MISSING
     angle_limit: float = MISSING
+    stepped_angle_limit_deg: float = 90.0
+    stepped_angle_step_deg: float = 15.0
+    stepped_action_deadband: float = 0.33
     joint_signs: list[float] = MISSING
     wheel_base: float = MISSING
     wheel_radius: float = MISSING
@@ -660,6 +665,21 @@ class CmdVelFrontFlipperAction(ActionTerm):
         self._flipper_targets = torch.zeros(self.num_envs, len(self._flipper_joint_ids), device=self.device)
         self._drive_targets = torch.zeros(self.num_envs, len(self._drive_joint_ids), device=self.device)
 
+        stepped_limit = cfg.stepped_angle_limit_deg * pi / 180.0
+        stepped_step = cfg.stepped_angle_step_deg * pi / 180.0
+        self._stepped_angle_bins = torch.arange(
+            -stepped_limit,
+            stepped_limit + 0.5 * stepped_step,
+            stepped_step,
+            device=self.device,
+        )
+        self._stepped_angle_index = torch.full(
+            (self.num_envs,),
+            len(self._stepped_angle_bins) // 2,
+            device=self.device,
+            dtype=torch.long,
+        )
+
     @property
     def action_dim(self):
         return 1
@@ -681,12 +701,38 @@ class CmdVelFrontFlipperAction(ActionTerm):
             env_ids = slice(None)
         self._raw_actions[env_ids] = 0.0
         self._prev_raw_actions[env_ids] = 0.0
+        self._stepped_angle_index[env_ids] = len(self._stepped_angle_bins) // 2
 
     def process_actions(self, actions):
         self._prev_raw_actions[:] = self._raw_actions
         safe_actions = torch.nan_to_num(actions.float(), nan=0.0, posinf=1.0, neginf=-1.0)
-        self._raw_actions[:] = torch.clamp(safe_actions, -1.0, 1.0)
-        flipper_angle = self._raw_actions[:, 0] * self.cfg.angle_limit
+        safe_actions = torch.clamp(safe_actions, -1.0, 1.0)
+
+        if self.cfg.action_mode == "continuous":
+            self._raw_actions[:] = safe_actions
+            flipper_angle = self._raw_actions[:, 0] * self.cfg.angle_limit
+        elif self.cfg.action_mode == "stepped":
+            action_step = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
+            action_step = torch.where(
+                safe_actions[:, 0] > self.cfg.stepped_action_deadband,
+                torch.ones_like(action_step),
+                action_step,
+            )
+            action_step = torch.where(
+                safe_actions[:, 0] < -self.cfg.stepped_action_deadband,
+                -torch.ones_like(action_step),
+                action_step,
+            )
+            self._stepped_angle_index[:] = torch.clamp(
+                self._stepped_angle_index + action_step,
+                0,
+                len(self._stepped_angle_bins) - 1,
+            )
+            flipper_angle = self._stepped_angle_bins[self._stepped_angle_index]
+            self._raw_actions[:, 0] = flipper_angle / self._stepped_angle_bins[-1].clamp_min(1.0e-6)
+        else:
+            raise ValueError(f"Unsupported action_mode: {self.cfg.action_mode}")
+
         self._flipper_targets[:] = flipper_angle.unsqueeze(1) * self._joint_signs
 
     def apply_actions(self):
@@ -722,6 +768,7 @@ class ActionsCfg:
     front_flipper = CmdVelFrontFlipperActionCfg(
         class_type=CmdVelFrontFlipperAction,
         asset_name="robot",
+        action_mode="continuous",
         flipper_joint_names=[
             "flipper_front_left_joint",
             "flipper_front_right_joint",

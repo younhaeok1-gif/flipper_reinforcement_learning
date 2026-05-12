@@ -380,6 +380,21 @@ def front_obstacle_features(
     return torch.nan_to_num(features, nan=0.0, posinf=1.0, neginf=0.0)
 
 
+def obstacle_gated_velocity_tracking_exp(
+    env: ManagerBasedRLEnv,
+    lin_std: float = 0.25,
+    ang_std: float = 0.4,
+    obstacle_threshold: float = 0.08,
+    obstacle_scale: float = 0.25,
+) -> torch.Tensor:
+    """Reward velocity tracking, but soften it when the front scanner sees a relevant obstacle."""
+    tracking = velocity_tracking_exp(env, lin_std=lin_std, ang_std=ang_std)
+    obstacle_features = front_obstacle_features(env)
+    obstacle_height = obstacle_features[:, 0]
+    near_obstacle = obstacle_height > obstacle_threshold
+    return torch.where(near_obstacle, tracking * obstacle_scale, tracking)
+
+
 def terrain_relative_orientation_l2(
     env: ManagerBasedRLEnv,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
@@ -707,13 +722,12 @@ class ObservationsCfg:
 
 @configclass
 class RewardsCfg:
-    velocity_tracking = RewTerm(func=velocity_tracking_exp, weight=0.5)
-    action_rate = RewTerm(func=mdp.action_rate_l2, weight=-0.02)
-    action_l2 = RewTerm(func=mdp.action_l2, weight=-0.02)
+    velocity_tracking = RewTerm(func=obstacle_gated_velocity_tracking_exp, weight=0.5)
+    action_rate = RewTerm(func=clamped_action_rate_l2, weight=-0.02)
+    action_l2 = RewTerm(func=clamped_action_l2, weight=-0.02)
     excessive_flat_orientation = RewTerm(func=excessive_flat_orientation_l2, weight=-1.0)
     excessive_pitch = RewTerm(func=excessive_pitch_l2, weight=-1.0)
     flipper_cruise_clearance = RewTerm(func=flipper_cruise_clearance_exp, weight=0.5)
-    flipper_tip_obstacle_height = RewTerm(func=flipper_tip_obstacle_height_l1, weight=-1.0)
     termination = RewTerm(func=mdp.is_terminated, weight=-100.0)
 
 

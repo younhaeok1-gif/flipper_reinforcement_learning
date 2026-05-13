@@ -5,9 +5,11 @@ from math import pi
 
 import isaaclab.envs.mdp as mdp
 import isaaclab.sim as sim_utils
+import isaaclab.terrains as terrain_gen
 from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg
 from isaaclab.envs import ManagerBasedRLEnv, ManagerBasedRLEnvCfg, ViewerCfg
+from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
@@ -18,10 +20,32 @@ from isaaclab.managers.action_manager import ActionTerm, ActionTermCfg
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sensors import ContactSensorCfg, FrameTransformerCfg, RayCasterCfg
 from isaaclab.sensors.ray_caster.patterns import GridPatternCfg
-from isaaclab.terrains import TerrainImporterCfg
-from isaaclab.terrains.config.rough import ROUGH_TERRAINS_CFG
+from isaaclab.terrains import TerrainGeneratorCfg, TerrainImporterCfg
 from isaaclab.utils import configclass
 from isaaclab.utils import math as math_utils
+
+
+STAIRS_TERRAINS_CFG = TerrainGeneratorCfg(
+    size=(8.0, 6.0),
+    border_width=20.0,
+    num_rows=8,
+    num_cols=4,
+    curriculum=True,
+    horizontal_scale=0.1,
+    vertical_scale=0.005,
+    slope_threshold=0.75,
+    use_cache=False,
+    sub_terrains={
+        "stairs": terrain_gen.MeshPyramidStairsTerrainCfg(
+            proportion=1.0,
+            step_height_range=(0.04, 0.18),
+            step_width=0.35,
+            platform_width=2.0,
+            border_width=1.0,
+            holes=False,
+        ),
+    },
+)
 
 
 def commanded_base_velocity(env: ManagerBasedRLEnv) -> torch.Tensor:
@@ -29,6 +53,29 @@ def commanded_base_velocity(env: ManagerBasedRLEnv) -> torch.Tensor:
     if not hasattr(env, "commanded_cmd_vel"):
         return torch.zeros(env.num_envs, 2, device=env.device)
     return env.commanded_cmd_vel
+
+
+def stairs_terrain_levels(
+    env: ManagerBasedRLEnv,
+    env_ids,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    success_distance: float = 3.0,
+    failure_distance: float = 0.5,
+) -> torch.Tensor:
+    """Increase stair difficulty when the robot moves far enough along +x."""
+    if isinstance(env_ids, slice):
+        env_ids = torch.arange(env.num_envs, device=env.device)
+    elif not isinstance(env_ids, torch.Tensor):
+        env_ids = torch.tensor(env_ids, device=env.device, dtype=torch.long)
+
+    robot = env.scene[asset_cfg.name]
+    terrain = env.scene.terrain
+    forward_distance = robot.data.root_pos_w[env_ids, 0] - env.scene.env_origins[env_ids, 0]
+    move_up = forward_distance > success_distance
+    move_down = forward_distance < failure_distance
+    move_down &= ~move_up
+    terrain.update_env_origins(env_ids, move_up, move_down)
+    return torch.mean(terrain.terrain_levels.float())
 
 
 def velocity_tracking_exp(
@@ -660,8 +707,8 @@ class CmdVelFlipperSceneCfg(InteractiveSceneCfg):
     terrain = TerrainImporterCfg(
         prim_path="/World/ground",
         terrain_type="generator",
-        terrain_generator=ROUGH_TERRAINS_CFG,
-        max_init_terrain_level=5,
+        terrain_generator=STAIRS_TERRAINS_CFG,
+        max_init_terrain_level=1,
         collision_group=-1,
         physics_material=sim_utils.RigidBodyMaterialCfg(
             friction_combine_mode="multiply",
@@ -942,15 +989,20 @@ class EventsCfg:
         params={
             "asset_cfg": SceneEntityCfg("robot"),
             "pose_range": {
-                "x": (-1.0, 1.0),
-                "y": (-1.0, 1.0),
+                "x": (-4.5, -4.0),
+                "y": (-0.15, 0.15),
                 "z": (0.5, 0.5),
-                "yaw": (-3.14, 3.14),
+                "yaw": (0.0, 0.0),
             },
             "velocity_range": {},
         },
         mode="reset",
     )
+
+
+@configclass
+class CurriculumCfg:
+    terrain_levels = CurrTerm(func=stairs_terrain_levels)
 
 
 @configclass
@@ -972,6 +1024,7 @@ class CmdVelFlipperEnvCfg(ManagerBasedRLEnvCfg):
     rewards: RewardsCfg = RewardsCfg()
     terminations: TerminationsCfg = TerminationsCfg()
     events: EventsCfg = EventsCfg()
+    curriculum: CurriculumCfg = CurriculumCfg()
 
-    command_lin_vel_range: tuple[float, float] = (0.0, 1.5)
-    command_ang_vel_range: tuple[float, float] = (-0.4, 0.4)
+    command_lin_vel_range: tuple[float, float] = (0.4, 0.4)
+    command_ang_vel_range: tuple[float, float] = (0.0, 0.0)

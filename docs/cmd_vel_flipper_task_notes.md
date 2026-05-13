@@ -125,7 +125,10 @@ Implementation in this repo:
 
 - Use `height_scanner` ray hits in front of the robot.
 - Convert hit points into the robot body frame.
-- Estimate local support ground height from `support_scanner`.
+- Convert `support_scanner` hits into the robot body frame and fit a local
+  support plane.
+- Measure each front hit's signed height relative to that local support plane,
+  instead of using world `z` height directly.
 - For each front grid point, compute a terrain angle using
   `atan2(relative_height, local_x)`.
 - Pick the front grid point with the largest terrain angle as the steepest

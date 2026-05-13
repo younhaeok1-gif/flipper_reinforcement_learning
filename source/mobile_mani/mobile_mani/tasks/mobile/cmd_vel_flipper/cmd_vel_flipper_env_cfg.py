@@ -305,14 +305,36 @@ def flipper_front_terrain_alignment_exp(
 
     support_points_w = support_sensor.data.ray_hits_w
     support_finite = torch.isfinite(support_points_w).all(dim=-1)
+    safe_support_points_w = torch.where(
+        support_finite.unsqueeze(-1),
+        support_points_w,
+        robot.data.root_pos_w.unsqueeze(1),
+    )
+    support_rel_points_w = safe_support_points_w - robot.data.root_pos_w.unsqueeze(1)
+    num_support_rays = support_points_w.shape[1]
+    support_points_b = math_utils.quat_apply_inverse(
+        robot.data.root_quat_w.repeat_interleave(num_support_rays, dim=0),
+        support_rel_points_w.reshape(-1, 3),
+    ).view_as(support_rel_points_w)
     support_count = support_finite.sum(dim=1).clamp_min(1)
-    support_ground_z = torch.where(
-        support_finite,
-        support_points_w[..., 2],
-        torch.zeros_like(support_points_w[..., 2]),
-    ).sum(dim=1) / support_count
+    support_centroid_b = torch.where(
+        support_finite.unsqueeze(-1),
+        support_points_b,
+        torch.zeros_like(support_points_b),
+    ).sum(dim=1) / support_count.unsqueeze(-1)
+    centered_support_points = torch.where(
+        support_finite.unsqueeze(-1),
+        support_points_b - support_centroid_b.unsqueeze(1),
+        torch.zeros_like(support_points_b),
+    )
+    _, _, vh = torch.linalg.svd(centered_support_points)
+    support_normal_b = torch.nn.functional.normalize(vh[:, -1, :], dim=1)
+    support_normal_b = torch.where(support_normal_b[:, 2:3] < 0.0, -support_normal_b, support_normal_b)
 
-    relative_height = safe_points_w[..., 2] - support_ground_z.unsqueeze(1)
+    relative_height = torch.sum(
+        (points_b - support_centroid_b.unsqueeze(1)) * support_normal_b.unsqueeze(1),
+        dim=-1,
+    )
     front_mask = (
         finite
         & (points_b[..., 0] >= x_range[0])

@@ -98,44 +98,6 @@ def wheel_contact_smoothness_l2(
     return force_spike + variation_scale * force_variation
 
 
-def track_wheel_contact_count_reward(
-    env: ManagerBasedRLEnv,
-    sensor_cfg: SceneEntityCfg = SceneEntityCfg("track_wheel_contacts"),
-    contact_force_threshold: float = 5.0,
-    neutral_contact_count: float = 5.0,
-    wheel_count_per_side: float = 9.0,
-) -> torch.Tensor:
-    """Reward main track wheels when enough wheels are in contact with the ground.
-
-    The average contacted wheel count per side is used:
-    - 5 contacted wheels gives 0.
-    - 6 or more contacted wheels gives a linearly increasing positive reward.
-    - 4 or fewer contacted wheels gives a linearly decreasing negative reward.
-    """
-    sensor = env.scene.sensors[sensor_cfg.name]
-    contact_force = torch.linalg.norm(sensor.data.net_forces_w, dim=-1)
-    contact_force = torch.nan_to_num(contact_force, nan=0.0, posinf=contact_force_threshold, neginf=0.0)
-    is_contact = contact_force > contact_force_threshold
-
-    left_ids = [body_id for body_id, body_name in enumerate(sensor.body_names) if body_name.startswith("left_wheel")]
-    right_ids = [body_id for body_id, body_name in enumerate(sensor.body_names) if body_name.startswith("right_wheel")]
-
-    side_counts = []
-    if left_ids:
-        side_counts.append(torch.sum(is_contact[:, left_ids].float(), dim=1))
-    if right_ids:
-        side_counts.append(torch.sum(is_contact[:, right_ids].float(), dim=1))
-
-    if side_counts:
-        contact_count = torch.mean(torch.stack(side_counts, dim=1), dim=1)
-    else:
-        contact_count = torch.clamp(torch.sum(is_contact.float(), dim=1), max=wheel_count_per_side)
-
-    positive = (contact_count - neutral_contact_count) / (wheel_count_per_side - neutral_contact_count)
-    negative = (contact_count - neutral_contact_count) / neutral_contact_count
-    return torch.where(contact_count >= neutral_contact_count, positive, negative)
-
-
 def flipper_down_without_obstacle_l2(
     env: ManagerBasedRLEnv,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot", joint_names=["flipper_front_.*_joint"]),
@@ -265,6 +227,95 @@ def flipper_cruise_clearance_exp(
 
     reward_active = cruise_or_idle & tips_not_touching
     return torch.where(reward_active, clearance_reward, torch.zeros_like(clearance_reward))
+
+
+def flipper_front_terrain_alignment_exp(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    front_sensor_cfg: SceneEntityCfg = SceneEntityCfg("height_scanner"),
+    support_sensor_cfg: SceneEntityCfg = SceneEntityCfg("support_scanner"),
+    tip_frame_cfg: SceneEntityCfg = SceneEntityCfg("flipper_tip_frames"),
+    x_range: tuple[float, float] = (0.1, 1.0),
+    y_range: tuple[float, float] = (-0.45, 0.45),
+    min_vector_length: float = 0.05,
+    std: float = 0.45,
+) -> torch.Tensor:
+    """Reward the front flipper vector aligning with the steepest front terrain vector."""
+    robot = env.scene[asset_cfg.name]
+    front_sensor = env.scene.sensors[front_sensor_cfg.name]
+    support_sensor = env.scene.sensors[support_sensor_cfg.name]
+    tip_frames = env.scene.sensors[tip_frame_cfg.name]
+
+    points_w = front_sensor.data.ray_hits_w
+    finite = torch.isfinite(points_w).all(dim=-1)
+    safe_points_w = torch.where(finite.unsqueeze(-1), points_w, robot.data.root_pos_w.unsqueeze(1))
+    rel_points_w = safe_points_w - robot.data.root_pos_w.unsqueeze(1)
+    num_rays = points_w.shape[1]
+    points_b = math_utils.quat_apply_inverse(
+        robot.data.root_quat_w.repeat_interleave(num_rays, dim=0),
+        rel_points_w.reshape(-1, 3),
+    ).view_as(rel_points_w)
+
+    support_points_w = support_sensor.data.ray_hits_w
+    support_finite = torch.isfinite(support_points_w).all(dim=-1)
+    support_count = support_finite.sum(dim=1).clamp_min(1)
+    support_ground_z = torch.where(
+        support_finite,
+        support_points_w[..., 2],
+        torch.zeros_like(support_points_w[..., 2]),
+    ).sum(dim=1) / support_count
+
+    relative_height = safe_points_w[..., 2] - support_ground_z.unsqueeze(1)
+    front_mask = (
+        finite
+        & (points_b[..., 0] >= x_range[0])
+        & (points_b[..., 0] <= x_range[1])
+        & (points_b[..., 1] >= y_range[0])
+        & (points_b[..., 1] <= y_range[1])
+    )
+    terrain_angle = torch.atan2(relative_height, torch.clamp(points_b[..., 0], min=1.0e-3))
+    terrain_angle = torch.where(front_mask, terrain_angle, torch.full_like(terrain_angle, -pi))
+    target_ids = torch.argmax(terrain_angle, dim=1)
+    env_ids = torch.arange(env.num_envs, device=env.device)
+
+    target_x = points_b[env_ids, target_ids, 0]
+    target_z = relative_height[env_ids, target_ids]
+    terrain_vec_b = torch.stack(
+        [
+            target_x,
+            torch.zeros_like(target_x),
+            target_z,
+        ],
+        dim=1,
+    )
+    has_target = front_mask.any(dim=1)
+    terrain_vec_b = torch.where(
+        has_target.unsqueeze(1),
+        terrain_vec_b,
+        torch.tensor([1.0, 0.0, 0.0], device=env.device).unsqueeze(0),
+    )
+
+    tip_pos_w = torch.mean(tip_frames.data.target_pos_w, dim=1)
+    flipper_vec_w = tip_pos_w - robot.data.root_pos_w
+    flipper_vec_b = math_utils.quat_apply_inverse(robot.data.root_quat_w, flipper_vec_w)
+    flipper_vec_b = torch.stack(
+        [
+            flipper_vec_b[:, 0],
+            torch.zeros_like(flipper_vec_b[:, 0]),
+            flipper_vec_b[:, 2],
+        ],
+        dim=1,
+    )
+
+    terrain_len = torch.linalg.norm(terrain_vec_b, dim=1)
+    flipper_len = torch.linalg.norm(flipper_vec_b, dim=1)
+    valid = (terrain_len > min_vector_length) & (flipper_len > min_vector_length)
+    terrain_dir = torch.nn.functional.normalize(terrain_vec_b, dim=1)
+    flipper_dir = torch.nn.functional.normalize(flipper_vec_b, dim=1)
+    alignment = torch.sum(terrain_dir * flipper_dir, dim=1).clamp(-1.0, 1.0)
+    angle_error = torch.acos(alignment)
+    reward = torch.exp(-torch.square(angle_error / std))
+    return torch.where(valid, reward, torch.zeros_like(reward))
 
 
 def excessive_pitch_l2(
@@ -669,12 +720,6 @@ class CmdVelFlipperSceneCfg(InteractiveSceneCfg):
         debug_vis=False,
     )
 
-    track_wheel_contacts = ContactSensorCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/(left_wheel_.*|right_wheel_.*)",
-        history_length=3,
-        debug_vis=False,
-    )
-
     light: AssetBaseCfg = AssetBaseCfg(
         prim_path="/World/light",
         spawn=sim_utils.DomeLightCfg(intensity=2000.0),
@@ -879,7 +924,7 @@ class ObservationsCfg:
 class RewardsCfg:
     action_rate = RewTerm(func=clamped_action_rate_l2, weight=-0.02)
     action_l2 = RewTerm(func=clamped_action_l2, weight=-0.02)
-    track_wheel_contact_count = RewTerm(func=track_wheel_contact_count_reward, weight=0.5)
+    flipper_front_terrain_alignment = RewTerm(func=flipper_front_terrain_alignment_exp, weight=0.3)
     flipper_cruise_clearance = RewTerm(func=flipper_cruise_clearance_exp, weight=0.5)
     termination = RewTerm(func=mdp.is_terminated, weight=-100.0)
 

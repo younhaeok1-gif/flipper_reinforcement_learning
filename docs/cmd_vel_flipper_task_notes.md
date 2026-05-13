@@ -88,8 +88,8 @@ Current active rewards in `RewardsCfg`:
 
 - `action_rate`: negative action-rate penalty using the clamped flipper action.
 - `action_l2`: negative action magnitude penalty using the clamped flipper action.
-- `track_wheel_contact_count`: signed reward for keeping enough main track
-  wheels in contact with the ground.
+- `flipper_front_terrain_alignment`: positive reward for aligning the front
+  flipper vector with the steepest front terrain vector.
 - `flipper_cruise_clearance`: positive reward for keeping front flipper tips near
   target clearance during cruise/idle, only while the tip rollers are not in
   contact.
@@ -111,23 +111,33 @@ Note: `wheel_contact_smoothness_l2` expects a `wheel_contacts` sensor, but the
 current scene config does not define one. Do not enable it without adding the
 sensor.
 
-## Track Wheel Contact Count Reward
+Note: a `track_wheel_contact_count_reward` experiment was removed because it
+encouraged the policy to keep the flippers raised. The reward only saw wheel
+contact count, so lowering the flippers could reduce short-term wheel contact
+and become unintentionally discouraged.
 
-`track_wheel_contact_count_reward(...)` ignores the flippers and looks only at
-the main track wheel contact sensor:
+## Front Terrain Alignment Reward
 
-- `left_wheel_.*`
-- `right_wheel_.*`
+`flipper_front_terrain_alignment_exp(...)` is based on a paper-style idea:
+compare the robot's front terrain direction with the flipper direction.
 
-It counts contacted wheels per side, then averages left and right. With the
-default 9 wheels per side:
+Implementation in this repo:
 
-- 5 contacted wheels gives `0`
-- 6 to 9 contacted wheels gives a linearly increasing positive value
-- 4 to 0 contacted wheels gives a linearly decreasing negative value
+- Use `height_scanner` ray hits in front of the robot.
+- Convert hit points into the robot body frame.
+- Estimate local support ground height from `support_scanner`.
+- For each front grid point, compute a terrain angle using
+  `atan2(relative_height, local_x)`.
+- Pick the front grid point with the largest terrain angle as the steepest
+  terrain target.
+- Build a terrain vector `[x, 0, relative_height]`.
+- Build a flipper vector from robot root to the average of `ffl_roller_9` and
+  `ffr_roller_9`.
+- Project both vectors into the body x-z plane.
+- Give an exponential reward when the angle between the two vectors is small.
 
-The reward is normalized around roughly `[-1, 1]` before the `RewardsCfg` weight
-is applied.
+The initial reward weight is deliberately modest so the policy does not ignore
+other objectives and only chase terrain alignment.
 
 ## Recent Change: Cruise Clearance Became Praise
 

@@ -304,8 +304,9 @@ def local_height_grid(
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     sensor_cfg: SceneEntityCfg = SceneEntityCfg("terrain_grid_scanner"),
     support_sensor_cfg: SceneEntityCfg = SceneEntityCfg("support_scanner"),
+    top_k: int = 3,
 ) -> torch.Tensor:
-    """Return max terrain height per local grid cell, relative to support ground height."""
+    """Return top-k average terrain height per local grid cell, relative to support ground height."""
     robot = env.scene[asset_cfg.name]
     sensor = env.scene.sensors[sensor_cfg.name]
     support_sensor = env.scene.sensors[support_sensor_cfg.name]
@@ -329,8 +330,8 @@ def local_height_grid(
         torch.zeros_like(support_points_w[..., 2]),
     ).sum(dim=1) / support_count
 
-    x_bins = ((0.7, 1.0), (0.3, 0.7), (0.0, 0.3), (-0.3, 0.0), (-0.7, -0.3))
-    y_bins = ((-0.5, 0.0), (0.0, 0.5))
+    x_bins = ((0.0, 0.25), (0.25, 0.5), (0.5, 0.75), (0.75, 1.0))
+    y_bins = ((-0.5, -0.25), (-0.25, 0.0), (0.0, 0.25), (0.25, 0.5))
     cell_heights = []
     for x_min, x_max in x_bins:
         for y_min, y_max in y_bins:
@@ -342,9 +343,12 @@ def local_height_grid(
                 & (points_b[..., 1] < y_max)
             )
             masked_z = torch.where(cell_mask, safe_points_w[..., 2], torch.full_like(points_w[..., 2], -1.0e6))
-            max_z = torch.max(masked_z, dim=1).values
-            has_hit = cell_mask.any(dim=1)
-            relative_height = torch.where(has_hit, max_z - support_ground_z, torch.zeros_like(max_z))
+            top_values = torch.topk(masked_z, k=min(top_k, masked_z.shape[1]), dim=1).values
+            top_valid = top_values > -1.0e5
+            top_count = top_valid.sum(dim=1).clamp_min(1)
+            top_mean_z = torch.where(top_valid, top_values, torch.zeros_like(top_values)).sum(dim=1) / top_count
+            has_hit = top_valid.any(dim=1)
+            relative_height = torch.where(has_hit, top_mean_z - support_ground_z, torch.zeros_like(top_mean_z))
             cell_heights.append(torch.clamp(relative_height, -0.5, 1.0))
 
     return torch.stack(cell_heights, dim=1)
@@ -818,7 +822,6 @@ class ObservationsCfg:
             scale=1.0,
         )
         terrain_height_grid = ObsTerm(func=local_height_grid, scale=1.0)
-        front_obstacle_features = ObsTerm(func=front_obstacle_features, scale=1.0)
         actions = ObsTerm(func=clamped_last_action, scale=1.0)
 
         def __post_init__(self):
@@ -830,12 +833,8 @@ class ObservationsCfg:
 
 @configclass
 class RewardsCfg:
-    velocity_tracking = RewTerm(func=obstacle_gated_velocity_tracking_exp, weight=0.5)
     action_rate = RewTerm(func=clamped_action_rate_l2, weight=-0.02)
     action_l2 = RewTerm(func=clamped_action_l2, weight=-0.02)
-    excessive_flat_orientation = RewTerm(func=excessive_flat_orientation_l2, weight=-1.0)
-    excessive_pitch = RewTerm(func=excessive_pitch_l2, weight=-1.0)
-    flipper_distal_contact_pitch = RewTerm(func=flipper_distal_contact_pitch_l2, weight=-5.0)
     flipper_cruise_clearance = RewTerm(func=flipper_cruise_clearance_exp, weight=0.5)
     termination = RewTerm(func=mdp.is_terminated, weight=-100.0)
 

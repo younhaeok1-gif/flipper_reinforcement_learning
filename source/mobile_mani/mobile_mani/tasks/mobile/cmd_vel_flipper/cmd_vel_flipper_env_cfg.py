@@ -98,6 +98,44 @@ def wheel_contact_smoothness_l2(
     return force_spike + variation_scale * force_variation
 
 
+def track_wheel_contact_count_reward(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("track_wheel_contacts"),
+    contact_force_threshold: float = 5.0,
+    neutral_contact_count: float = 5.0,
+    wheel_count_per_side: float = 9.0,
+) -> torch.Tensor:
+    """Reward main track wheels when enough wheels are in contact with the ground.
+
+    The average contacted wheel count per side is used:
+    - 5 contacted wheels gives 0.
+    - 6 or more contacted wheels gives a linearly increasing positive reward.
+    - 4 or fewer contacted wheels gives a linearly decreasing negative reward.
+    """
+    sensor = env.scene.sensors[sensor_cfg.name]
+    contact_force = torch.linalg.norm(sensor.data.net_forces_w, dim=-1)
+    contact_force = torch.nan_to_num(contact_force, nan=0.0, posinf=contact_force_threshold, neginf=0.0)
+    is_contact = contact_force > contact_force_threshold
+
+    left_ids = [body_id for body_id, body_name in enumerate(sensor.body_names) if body_name.startswith("left_wheel")]
+    right_ids = [body_id for body_id, body_name in enumerate(sensor.body_names) if body_name.startswith("right_wheel")]
+
+    side_counts = []
+    if left_ids:
+        side_counts.append(torch.sum(is_contact[:, left_ids].float(), dim=1))
+    if right_ids:
+        side_counts.append(torch.sum(is_contact[:, right_ids].float(), dim=1))
+
+    if side_counts:
+        contact_count = torch.mean(torch.stack(side_counts, dim=1), dim=1)
+    else:
+        contact_count = torch.clamp(torch.sum(is_contact.float(), dim=1), max=wheel_count_per_side)
+
+    positive = (contact_count - neutral_contact_count) / (wheel_count_per_side - neutral_contact_count)
+    negative = (contact_count - neutral_contact_count) / neutral_contact_count
+    return torch.where(contact_count >= neutral_contact_count, positive, negative)
+
+
 def flipper_down_without_obstacle_l2(
     env: ManagerBasedRLEnv,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot", joint_names=["flipper_front_.*_joint"]),
@@ -631,6 +669,12 @@ class CmdVelFlipperSceneCfg(InteractiveSceneCfg):
         debug_vis=False,
     )
 
+    track_wheel_contacts = ContactSensorCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/(left_wheel_.*|right_wheel_.*)",
+        history_length=3,
+        debug_vis=False,
+    )
+
     light: AssetBaseCfg = AssetBaseCfg(
         prim_path="/World/light",
         spawn=sim_utils.DomeLightCfg(intensity=2000.0),
@@ -835,6 +879,7 @@ class ObservationsCfg:
 class RewardsCfg:
     action_rate = RewTerm(func=clamped_action_rate_l2, weight=-0.02)
     action_l2 = RewTerm(func=clamped_action_l2, weight=-0.02)
+    track_wheel_contact_count = RewTerm(func=track_wheel_contact_count_reward, weight=0.5)
     flipper_cruise_clearance = RewTerm(func=flipper_cruise_clearance_exp, weight=0.5)
     termination = RewTerm(func=mdp.is_terminated, weight=-100.0)
 

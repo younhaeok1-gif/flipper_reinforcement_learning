@@ -86,24 +86,22 @@ Important terrain helpers:
 
 Current active rewards in `RewardsCfg`:
 
-- `velocity_tracking`: positive exponential reward for matching sampled `cmd_vel`.
-- `action_rate`: negative action-rate penalty from Isaac Lab MDP.
-- `action_l2`: negative action magnitude penalty from Isaac Lab MDP.
-- `excessive_flat_orientation`: negative roll/pitch tilt penalty.
-- `excessive_pitch`: negative pitch-like tilt penalty to discourage standing up.
-- `flipper_distal_contact_pitch`: stronger negative penalty when contact load is
-  concentrated toward the front flipper tips while the body is pitched up.
+- `action_rate`: negative action-rate penalty using the clamped flipper action.
+- `action_l2`: negative action magnitude penalty using the clamped flipper action.
+- `track_wheel_contact_count`: signed reward for keeping enough main track
+  wheels in contact with the ground.
 - `flipper_cruise_clearance`: positive reward for keeping front flipper tips near
   target clearance during cruise/idle, only while the tip rollers are not in
   contact.
-- `flipper_tip_obstacle_height`: negative penalty for mismatch between tip height
-  and estimated upcoming obstacle height.
 - `termination`: large negative penalty on termination.
 
 Several helper rewards are defined but not currently active:
 
-- `clamped_action_l2`
-- `clamped_action_rate_l2`
+- `velocity_tracking_exp`
+- `obstacle_gated_velocity_tracking_exp`
+- `excessive_flat_orientation_l2`
+- `excessive_pitch_l2`
+- `flipper_distal_contact_pitch_l2`
 - `wheel_contact_smoothness_l2`
 - `flipper_down_without_obstacle_l2`
 - `base_orientation_stability_exp`
@@ -112,6 +110,24 @@ Several helper rewards are defined but not currently active:
 Note: `wheel_contact_smoothness_l2` expects a `wheel_contacts` sensor, but the
 current scene config does not define one. Do not enable it without adding the
 sensor.
+
+## Track Wheel Contact Count Reward
+
+`track_wheel_contact_count_reward(...)` ignores the flippers and looks only at
+the main track wheel contact sensor:
+
+- `left_wheel_.*`
+- `right_wheel_.*`
+
+It counts contacted wheels per side, then averages left and right. With the
+default 9 wheels per side:
+
+- 5 contacted wheels gives `0`
+- 6 to 9 contacted wheels gives a linearly increasing positive value
+- 4 to 0 contacted wheels gives a linearly decreasing negative value
+
+The reward is normalized around roughly `[-1, 1]` before the `RewardsCfg` weight
+is applied.
 
 ## Recent Change: Cruise Clearance Became Praise
 

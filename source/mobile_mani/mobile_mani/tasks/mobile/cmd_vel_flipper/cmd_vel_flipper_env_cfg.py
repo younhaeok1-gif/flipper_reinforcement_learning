@@ -56,180 +56,180 @@ def commanded_base_velocity(env: ManagerBasedRLEnv) -> torch.Tensor:
 
 
 def stairs_terrain_levels(
-    env: ManagerBasedRLEnv,
-    env_ids,
-    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-    success_distance: float = 3.0,
-    failure_distance: float = 0.5,
+    env: ManagerBasedRLEnv,     #RL environment 객체 
+    env_ids,                    #이번에 curriculum을 업데이트할 env index들
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),    #어떤 asset을 기준으로 볼지 설정
+    success_distance: float = 3.0,      #거리보다 앞으로 가면 성공 terrain level 상승
+    failure_distance: float = 0.5,      #거리보다 못가면 하락
 ) -> torch.Tensor:
     """Increase stair difficulty when the robot moves far enough along +x."""
-    if isinstance(env_ids, slice):
-        env_ids = torch.arange(env.num_envs, device=env.device)
+    if isinstance(env_ids, slice):                  
+        env_ids = torch.arange(env.num_envs, device=env.device)                 #env_ids가 slice같은 형태로 들어올 때 env index를 직접 tensor로 만든다
     elif not isinstance(env_ids, torch.Tensor):
-        env_ids = torch.tensor(env_ids, device=env.device, dtype=torch.long)
+        env_ids = torch.tensor(env_ids, device=env.device, dtype=torch.long)    #env_ids가 python list나 tuple이면 torch tensor로 바꿈
 
-    robot = env.scene[asset_cfg.name]
-    terrain = env.scene.terrain
-    forward_distance = robot.data.root_pos_w[env_ids, 0] - env.scene.env_origins[env_ids, 0]
-    move_up = forward_distance > success_distance
-    move_down = forward_distance < failure_distance
-    move_down &= ~move_up
-    terrain.update_env_origins(env_ids, move_up, move_down)
-    return torch.mean(terrain.terrain_levels.float())
+    robot = env.scene[asset_cfg.name]   #로봇 현재 위치, 속도, 관절 상태 등등 가져옴
+    terrain = env.scene.terrain         #terrain정보를 가지고옴
+    forward_distance = robot.data.root_pos_w[env_ids, 0] - env.scene.env_origins[env_ids, 0]    #로봇이 얼마나 이동했는지 계산
+    move_up = forward_distance > success_distance       #이동 얼마 이상 했으면 move up
+    move_down = forward_distance < failure_distance     #이동 얼마 이상 못했으면 move down
+    move_down &= ~move_up               #move up, down이 동시에 true가 되는 상황을 막음
+    terrain.update_env_origins(env_ids, move_up, move_down) #isaac lab에서 terrain level을 업데이트 함
+    return torch.mean(terrain.terrain_levels.float())   #현재 전체 env의 평균 terrain level반환
 
 
 def velocity_tracking_exp(
-    env: ManagerBasedRLEnv,
-    lin_std: float = 0.25,
-    ang_std: float = 0.4,
-    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    env: ManagerBasedRLEnv,         #객체
+    lin_std: float = 0.25,          #선속도의 오차를 얼마나 민감하게 볼지 정하는 값(작을수록 선속도 오차에 엄격함)
+    ang_std: float = 0.4,           #각속도에 오차를 얼마나 민감하게 볼지 정하는 값
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),    #어떤 asset의 속도를 볼지 설정
 ) -> torch.Tensor:
     """Reward tracking of the commanded cmd_vel by the measured base velocity."""
-    robot = env.scene[asset_cfg.name]
-    command = commanded_base_velocity(env)
-    lin_error = torch.square(command[:, 0] - robot.data.root_lin_vel_b[:, 0])
-    ang_error = torch.square(command[:, 1] - robot.data.root_ang_vel_b[:, 2])
-    return torch.exp(-(lin_error / lin_std**2 + ang_error / ang_std**2))
+    robot = env.scene[asset_cfg.name]       #robot의 asset을 가져옴
+    command = commanded_base_velocity(env)  #env에 저장된 명령 속도 가져옴
+    lin_error = torch.square(command[:, 0] - robot.data.root_lin_vel_b[:, 0])   #에러값 계산
+    ang_error = torch.square(command[:, 1] - robot.data.root_ang_vel_b[:, 2])   #에러값 계산
+    return torch.exp(-(lin_error / lin_std**2 + ang_error / ang_std**2))    #에러값 기반 최종 reward 계산
 
 
 def clamped_last_action(env: ManagerBasedRLEnv, action_name: str = "front_flipper") -> torch.Tensor:
     """Return the finite, clamped action stored by the flipper action term."""
-    return env.action_manager.get_term(action_name).raw_actions
+    return env.action_manager.get_term(action_name).raw_actions  # action term 안에 저장된 안전한 action값 반환
 
 
 def clamped_action_l2(env: ManagerBasedRLEnv, action_name: str = "front_flipper") -> torch.Tensor:
     """Penalize the action actually accepted by the flipper action term."""
-    actions = env.action_manager.get_term(action_name).raw_actions
-    return torch.sum(torch.square(actions), dim=1)
+    actions = env.action_manager.get_term(action_name).raw_actions    # clamp/sanitize된 실제 적용 action
+    return torch.sum(torch.square(actions), dim=1)                    # action 크기 제곱 패널티
 
 
 def clamped_action_rate_l2(env: ManagerBasedRLEnv, action_name: str = "front_flipper") -> torch.Tensor:
     """Penalize changes in the finite, clamped flipper action."""
-    action_term = env.action_manager.get_term(action_name)
-    return torch.sum(torch.square(action_term.raw_actions - action_term.prev_raw_actions), dim=1)
+    action_term = env.action_manager.get_term(action_name)    # 현재 action term 가져옴
+    return torch.sum(torch.square(action_term.raw_actions - action_term.prev_raw_actions), dim=1)  # action 변화량 패널티
 
 
-def front_flipper_tip_z_w(
-    env: ManagerBasedRLEnv,
-    tip_frame_cfg: SceneEntityCfg = SceneEntityCfg("flipper_tip_frames"),
+def front_flipper_tip_z_w(      #앞쪽 플리퍼 끝부분의 world z높이를 계산하는 함수
+    env: ManagerBasedRLEnv,     #객체
+    tip_frame_cfg: SceneEntityCfg = SceneEntityCfg("flipper_tip_frames"),   #sensor 설정, 어떤 센서를 사용할지 정함, 지금은 flipper_tip_frames
 ) -> torch.Tensor:
     """Return the average world-z position of the two front flipper tip links."""
-    tip_frames = env.scene.sensors[tip_frame_cfg.name]
-    tip_pos_w = tip_frames.data.target_pos_w
-    tip_z_w = torch.mean(tip_pos_w[..., 2], dim=1)
-    return torch.nan_to_num(tip_z_w, nan=0.0, posinf=0.0, neginf=0.0)
+    tip_frames = env.scene.sensors[tip_frame_cfg.name]    # flipper tip frame sensor 가져옴
+    tip_pos_w = tip_frames.data.target_pos_w              # tip들의 world 좌표
+    tip_z_w = torch.mean(tip_pos_w[..., 2], dim=1)        # 좌우 tip의 z높이를 평균냄
+    return torch.nan_to_num(tip_z_w, nan=0.0, posinf=0.0, neginf=0.0)  # 비정상값 방지
 
 
 def wheel_contact_smoothness_l2(
-    env: ManagerBasedRLEnv,
-    sensor_cfg: SceneEntityCfg = SceneEntityCfg("wheel_contacts"),
-    force_threshold: float = 300.0,
-    delta_threshold: float = 150.0,
-    variation_scale: float = 0.25,
+    env: ManagerBasedRLEnv,     # 객체
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("wheel_contacts"),    # 휠 contact sensor
+    force_threshold: float = 300.0,       # 힘이 이 값보다 크면 spike로 봄
+    delta_threshold: float = 150.0,       # 이전 step 대비 force 변화량 기준
+    variation_scale: float = 0.25,        # force 변화량 penalty 비중
 ) -> torch.Tensor:
     """Penalize large main-wheel contact force spikes and abrupt force changes."""
-    sensor = env.scene.sensors[sensor_cfg.name]
-    force_history = sensor.data.net_forces_w_history
+    sensor = env.scene.sensors[sensor_cfg.name]        # contact sensor 가져옴
+    force_history = sensor.data.net_forces_w_history   # 최근 contact force history
     if force_history is None or force_history.shape[1] < 2:
-        return torch.zeros(env.num_envs, device=env.device)
+        return torch.zeros(env.num_envs, device=env.device)   # history가 부족하면 penalty 없음
 
-    force_now = torch.linalg.norm(force_history[:, 0], dim=-1)
-    force_prev = torch.linalg.norm(force_history[:, 1], dim=-1)
+    force_now = torch.linalg.norm(force_history[:, 0], dim=-1)    # 현재 contact force 크기
+    force_prev = torch.linalg.norm(force_history[:, 1], dim=-1)   # 이전 contact force 크기
     force_now = torch.nan_to_num(force_now, nan=0.0, posinf=force_threshold, neginf=0.0)
     force_prev = torch.nan_to_num(force_prev, nan=0.0, posinf=force_threshold, neginf=0.0)
 
-    max_force = torch.max(force_now, dim=1).values
-    max_delta = torch.max(torch.abs(force_now - force_prev), dim=1).values
-    force_spike = torch.square(torch.clamp(max_force - force_threshold, min=0.0))
-    force_variation = torch.square(torch.clamp(max_delta - delta_threshold, min=0.0))
+    max_force = torch.max(force_now, dim=1).values                     # env별 최대 contact force
+    max_delta = torch.max(torch.abs(force_now - force_prev), dim=1).values  # env별 최대 force 변화량
+    force_spike = torch.square(torch.clamp(max_force - force_threshold, min=0.0))       # 큰 충격 penalty
+    force_variation = torch.square(torch.clamp(max_delta - delta_threshold, min=0.0))   # 급격한 변화 penalty
     return force_spike + variation_scale * force_variation
 
 
 def flipper_down_without_obstacle_l2(
-    env: ManagerBasedRLEnv,
-    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot", joint_names=["flipper_front_.*_joint"]),
-    front_sensor_cfg: SceneEntityCfg = SceneEntityCfg("height_scanner"),
-    support_sensor_cfg: SceneEntityCfg = SceneEntityCfg("support_scanner"),
-    obstacle_x_range: tuple[float, float] = (0.0, 0.9),
-    obstacle_y_range: tuple[float, float] = (-0.5, 0.5),
-    obstacle_threshold: float = 0.06,
-    command_threshold: float = 0.05,
-    down_angle_deadband: float = 0.15,
+    env: ManagerBasedRLEnv,     # 객체
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot", joint_names=["flipper_front_.*_joint"]),  # front flipper joint
+    front_sensor_cfg: SceneEntityCfg = SceneEntityCfg("height_scanner"),      # 앞쪽 terrain scanner
+    support_sensor_cfg: SceneEntityCfg = SceneEntityCfg("support_scanner"),   # 로봇 아래 지면 scanner
+    obstacle_x_range: tuple[float, float] = (0.0, 0.9),   # 장애물 확인 x범위
+    obstacle_y_range: tuple[float, float] = (-0.5, 0.5),  # 장애물 확인 y범위
+    obstacle_threshold: float = 0.06,     # 이 높이 이상이면 장애물로 판단
+    command_threshold: float = 0.05,      # 전진 command가 이 값보다 크면 주행 중으로 판단
+    down_angle_deadband: float = 0.15,    # 이 정도 아래각은 허용
 ) -> torch.Tensor:
     """Penalize digging the front flippers downward when there is no useful obstacle to engage."""
-    robot = env.scene[asset_cfg.name]
-    front_sensor = env.scene.sensors[front_sensor_cfg.name]
-    support_sensor = env.scene.sensors[support_sensor_cfg.name]
+    robot = env.scene[asset_cfg.name]                         # robot asset
+    front_sensor = env.scene.sensors[front_sensor_cfg.name]    # 앞쪽 ray sensor
+    support_sensor = env.scene.sensors[support_sensor_cfg.name]  # support ground sensor
 
-    points_w = front_sensor.data.ray_hits_w
-    finite = torch.isfinite(points_w).all(dim=-1)
-    safe_points_w = torch.where(finite.unsqueeze(-1), points_w, robot.data.root_pos_w.unsqueeze(1))
-    rel_points_w = safe_points_w - robot.data.root_pos_w.unsqueeze(1)
-    num_rays = points_w.shape[1]
+    points_w = front_sensor.data.ray_hits_w    # 앞쪽 terrain hit point(world)
+    finite = torch.isfinite(points_w).all(dim=-1)  # ray hit이 유효한지 확인
+    safe_points_w = torch.where(finite.unsqueeze(-1), points_w, robot.data.root_pos_w.unsqueeze(1))  # invalid hit 대체
+    rel_points_w = safe_points_w - robot.data.root_pos_w.unsqueeze(1)   # robot root 기준 상대좌표
+    num_rays = points_w.shape[1]    # ray 개수
     points_b = math_utils.quat_apply_inverse(
         robot.data.root_quat_w.repeat_interleave(num_rays, dim=0),
         rel_points_w.reshape(-1, 3),
-    ).view_as(rel_points_w)
+    ).view_as(rel_points_w)    # world 좌표를 body 좌표로 변환
 
-    support_points_w = support_sensor.data.ray_hits_w
+    support_points_w = support_sensor.data.ray_hits_w          # 로봇 아래쪽 ray hit
     support_finite = torch.isfinite(support_points_w).all(dim=-1)
-    support_count = support_finite.sum(dim=1).clamp_min(1)
+    support_count = support_finite.sum(dim=1).clamp_min(1)     # 유효한 support ray 개수
     support_ground_z = torch.where(
         support_finite,
         support_points_w[..., 2],
         torch.zeros_like(support_points_w[..., 2]),
-    ).sum(dim=1) / support_count
+    ).sum(dim=1) / support_count       # 로봇 아래 평균 지면 높이
 
-    relative_height = torch.clamp(safe_points_w[..., 2] - support_ground_z.unsqueeze(1), min=0.0, max=1.0)
+    relative_height = torch.clamp(safe_points_w[..., 2] - support_ground_z.unsqueeze(1), min=0.0, max=1.0)  # 상대 높이
     front_mask = (
         finite
         & (points_b[..., 0] >= obstacle_x_range[0])
         & (points_b[..., 0] <= obstacle_x_range[1])
         & (points_b[..., 1] >= obstacle_y_range[0])
         & (points_b[..., 1] <= obstacle_y_range[1])
-    )
+    )   # 앞쪽 관심 영역 mask
     obstacle_height = torch.max(torch.where(front_mask, relative_height, torch.zeros_like(relative_height)), dim=1).values
-    obstacle_active = obstacle_height > obstacle_threshold
-    command_active = commanded_base_velocity(env)[:, 0] > command_threshold
+    obstacle_active = obstacle_height > obstacle_threshold          # 앞에 유효한 장애물이 있는지
+    command_active = commanded_base_velocity(env)[:, 0] > command_threshold  # 전진 중인지
 
-    flipper_angles = robot.data.joint_pos[:, asset_cfg.joint_ids]
-    downward_angle = torch.clamp(flipper_angles, min=0.0)
+    flipper_angles = robot.data.joint_pos[:, asset_cfg.joint_ids]  # front flipper joint angle
+    downward_angle = torch.clamp(flipper_angles, min=0.0)          # 아래로 내린 각도만 사용
     downward_penalty = torch.mean(torch.square(torch.clamp(downward_angle - down_angle_deadband, min=0.0)), dim=1)
-    should_not_dig = ~(obstacle_active & command_active)
+    should_not_dig = ~(obstacle_active & command_active)           # 장애물 없거나 전진 중이 아니면 digging 방지
     return torch.where(should_not_dig, downward_penalty, torch.zeros_like(downward_penalty))
 
 
 def flipper_cruise_clearance_exp(
-    env: ManagerBasedRLEnv,
-    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-    front_sensor_cfg: SceneEntityCfg = SceneEntityCfg("height_scanner"),
-    support_sensor_cfg: SceneEntityCfg = SceneEntityCfg("support_scanner"),
-    tip_frame_cfg: SceneEntityCfg = SceneEntityCfg("flipper_tip_frames"),
-    contact_sensor_cfg: SceneEntityCfg = SceneEntityCfg("front_flipper_contacts"),
-    obstacle_x_range: tuple[float, float] = (0.0, 0.9),
-    obstacle_y_range: tuple[float, float] = (-0.5, 0.5),
-    obstacle_threshold: float = 0.06,
-    command_threshold: float = 0.05,
-    tip_contact_force_threshold: float = 5.0,
-    target_clearance: float = 0.03,
-    deadband: float = 0.02,
-    std: float = 0.08,
+    env: ManagerBasedRLEnv,     # 객체
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),             # robot asset
+    front_sensor_cfg: SceneEntityCfg = SceneEntityCfg("height_scanner"),      # 앞쪽 지형 scanner
+    support_sensor_cfg: SceneEntityCfg = SceneEntityCfg("support_scanner"),   # 로봇 아래 지면 scanner
+    tip_frame_cfg: SceneEntityCfg = SceneEntityCfg("flipper_tip_frames"),     # flipper tip frame sensor
+    contact_sensor_cfg: SceneEntityCfg = SceneEntityCfg("front_flipper_contacts"),  # front flipper contact sensor
+    obstacle_x_range: tuple[float, float] = (0.0, 0.9),   # 앞 장애물 확인 x범위
+    obstacle_y_range: tuple[float, float] = (-0.5, 0.5),  # 앞 장애물 확인 y범위
+    obstacle_threshold: float = 0.06,     # 이 높이 이상이면 장애물로 판단
+    command_threshold: float = 0.05,      # 전진 command 기준
+    tip_contact_force_threshold: float = 5.0,  # tip 접촉 여부 판단 force
+    target_clearance: float = 0.03,       # 목표 tip clearance
+    deadband: float = 0.02,               # clearance 오차 허용 범위
+    std: float = 0.08,                    # exponential reward 민감도
 ) -> torch.Tensor:
     """Reward front flipper tips staying lightly above ground without touching during cruise/idle."""
-    robot = env.scene[asset_cfg.name]
-    front_sensor = env.scene.sensors[front_sensor_cfg.name]
-    support_sensor = env.scene.sensors[support_sensor_cfg.name]
-    contact_sensor = env.scene.sensors[contact_sensor_cfg.name]
+    robot = env.scene[asset_cfg.name]                         # robot asset 가져옴
+    front_sensor = env.scene.sensors[front_sensor_cfg.name]    # 앞쪽 ray sensor
+    support_sensor = env.scene.sensors[support_sensor_cfg.name]  # support ground sensor
+    contact_sensor = env.scene.sensors[contact_sensor_cfg.name]  # front flipper contact sensor
 
-    points_w = front_sensor.data.ray_hits_w
+    points_w = front_sensor.data.ray_hits_w    # 앞쪽 지형 hit point(world)
     finite = torch.isfinite(points_w).all(dim=-1)
-    safe_points_w = torch.where(finite.unsqueeze(-1), points_w, robot.data.root_pos_w.unsqueeze(1))
-    rel_points_w = safe_points_w - robot.data.root_pos_w.unsqueeze(1)
+    safe_points_w = torch.where(finite.unsqueeze(-1), points_w, robot.data.root_pos_w.unsqueeze(1))  # invalid hit 대체
+    rel_points_w = safe_points_w - robot.data.root_pos_w.unsqueeze(1)   # robot root 기준 상대좌표
     num_rays = points_w.shape[1]
     points_b = math_utils.quat_apply_inverse(
         robot.data.root_quat_w.repeat_interleave(num_rays, dim=0),
         rel_points_w.reshape(-1, 3),
-    ).view_as(rel_points_w)
+    ).view_as(rel_points_w)    # body frame 좌표
 
     support_points_w = support_sensor.data.ray_hits_w
     support_finite = torch.isfinite(support_points_w).all(dim=-1)
@@ -238,70 +238,70 @@ def flipper_cruise_clearance_exp(
         support_finite,
         support_points_w[..., 2],
         torch.zeros_like(support_points_w[..., 2]),
-    ).sum(dim=1) / support_count
+    ).sum(dim=1) / support_count    # 현재 로봇 아래 평균 지면 높이
 
-    relative_height = torch.clamp(safe_points_w[..., 2] - support_ground_z.unsqueeze(1), min=0.0, max=1.0)
+    relative_height = torch.clamp(safe_points_w[..., 2] - support_ground_z.unsqueeze(1), min=0.0, max=1.0)  # 앞 지형 상대 높이
     front_mask = (
         finite
         & (points_b[..., 0] >= obstacle_x_range[0])
         & (points_b[..., 0] <= obstacle_x_range[1])
         & (points_b[..., 1] >= obstacle_y_range[0])
         & (points_b[..., 1] <= obstacle_y_range[1])
-    )
+    )   # 앞쪽 관심 영역
     obstacle_height = torch.max(torch.where(front_mask, relative_height, torch.zeros_like(relative_height)), dim=1).values
-    obstacle_active = obstacle_height > obstacle_threshold
-    command_active = commanded_base_velocity(env)[:, 0] > command_threshold
+    obstacle_active = obstacle_height > obstacle_threshold          # 앞에 장애물이 있는지
+    command_active = commanded_base_velocity(env)[:, 0] > command_threshold  # 전진 중인지
 
-    tip_clearance = front_flipper_tip_z_w(env, tip_frame_cfg) - support_ground_z
+    tip_clearance = front_flipper_tip_z_w(env, tip_frame_cfg) - support_ground_z  # 지면 기준 tip 높이
 
-    clearance_error = torch.abs(tip_clearance - target_clearance)
-    clearance_error = torch.clamp(clearance_error - deadband, min=0.0)
-    clearance_reward = torch.exp(-torch.square(clearance_error / std))
-    cruise_or_idle = ~(obstacle_active & command_active)
+    clearance_error = torch.abs(tip_clearance - target_clearance)   # 목표 clearance와의 차이
+    clearance_error = torch.clamp(clearance_error - deadband, min=0.0)   # deadband 안쪽은 오차 0
+    clearance_reward = torch.exp(-torch.square(clearance_error / std))   # clearance가 맞을수록 1에 가까움
+    cruise_or_idle = ~(obstacle_active & command_active)     # 장애물 전진 상황이 아닐 때만 활성
 
     tip_body_ids = [
         body_id
         for body_id, body_name in enumerate(contact_sensor.body_names)
         if body_name in ("ffl_roller_9", "ffr_roller_9")
-    ]
+    ]   # 앞 플리퍼 tip roller body id 찾기
     if tip_body_ids:
-        tip_forces = torch.linalg.norm(contact_sensor.data.net_forces_w[:, tip_body_ids], dim=-1)
+        tip_forces = torch.linalg.norm(contact_sensor.data.net_forces_w[:, tip_body_ids], dim=-1)  # tip 접촉 force
         tip_forces = torch.nan_to_num(tip_forces, nan=0.0, posinf=tip_contact_force_threshold, neginf=0.0)
-        max_tip_force = torch.max(tip_forces, dim=1).values
-        tips_not_touching = max_tip_force <= tip_contact_force_threshold
+        max_tip_force = torch.max(tip_forces, dim=1).values  # 좌우 tip 중 큰 force
+        tips_not_touching = max_tip_force <= tip_contact_force_threshold  # tip이 땅에 닿지 않았는지
     else:
-        tips_not_touching = torch.ones(env.num_envs, dtype=torch.bool, device=env.device)
+        tips_not_touching = torch.ones(env.num_envs, dtype=torch.bool, device=env.device)  # body id 못 찾으면 접촉 없음으로 처리
 
-    reward_active = cruise_or_idle & tips_not_touching
+    reward_active = cruise_or_idle & tips_not_touching   # 순항/대기 + tip 비접촉일 때만 보상
     return torch.where(reward_active, clearance_reward, torch.zeros_like(clearance_reward))
 
 
 def flipper_front_terrain_alignment_exp(
-    env: ManagerBasedRLEnv,
-    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-    front_sensor_cfg: SceneEntityCfg = SceneEntityCfg("height_scanner"),
-    support_sensor_cfg: SceneEntityCfg = SceneEntityCfg("support_scanner"),
-    tip_frame_cfg: SceneEntityCfg = SceneEntityCfg("flipper_tip_frames"),
-    x_range: tuple[float, float] = (0.1, 1.0),
-    y_range: tuple[float, float] = (-0.45, 0.45),
-    min_vector_length: float = 0.05,
-    std: float = 0.45,
+    env: ManagerBasedRLEnv,     # 객체
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),             # robot asset
+    front_sensor_cfg: SceneEntityCfg = SceneEntityCfg("height_scanner"),      # 앞쪽 지형 scanner
+    support_sensor_cfg: SceneEntityCfg = SceneEntityCfg("support_scanner"),   # 로봇 아래 지면 scanner
+    tip_frame_cfg: SceneEntityCfg = SceneEntityCfg("flipper_tip_frames"),     # flipper tip frame sensor
+    x_range: tuple[float, float] = (0.1, 1.0),       # 정렬 target을 찾을 앞쪽 x범위
+    y_range: tuple[float, float] = (-0.45, 0.45),    # 정렬 target을 찾을 y범위
+    min_vector_length: float = 0.05,     # 너무 짧은 vector는 무효 처리
+    std: float = 0.45,                   # 각도 오차 reward 민감도
 ) -> torch.Tensor:
     """Reward the front flipper vector aligning with the steepest front terrain vector."""
-    robot = env.scene[asset_cfg.name]
-    front_sensor = env.scene.sensors[front_sensor_cfg.name]
-    support_sensor = env.scene.sensors[support_sensor_cfg.name]
-    tip_frames = env.scene.sensors[tip_frame_cfg.name]
+    robot = env.scene[asset_cfg.name]                         # robot asset 가져옴
+    front_sensor = env.scene.sensors[front_sensor_cfg.name]    # 앞쪽 ray sensor
+    support_sensor = env.scene.sensors[support_sensor_cfg.name]  # support ground sensor
+    tip_frames = env.scene.sensors[tip_frame_cfg.name]         # flipper tip frame sensor
 
-    points_w = front_sensor.data.ray_hits_w
+    points_w = front_sensor.data.ray_hits_w    # 앞쪽 지형 hit point(world)
     finite = torch.isfinite(points_w).all(dim=-1)
-    safe_points_w = torch.where(finite.unsqueeze(-1), points_w, robot.data.root_pos_w.unsqueeze(1))
-    rel_points_w = safe_points_w - robot.data.root_pos_w.unsqueeze(1)
+    safe_points_w = torch.where(finite.unsqueeze(-1), points_w, robot.data.root_pos_w.unsqueeze(1))  # invalid hit 대체
+    rel_points_w = safe_points_w - robot.data.root_pos_w.unsqueeze(1)   # root 기준 상대좌표
     num_rays = points_w.shape[1]
     points_b = math_utils.quat_apply_inverse(
         robot.data.root_quat_w.repeat_interleave(num_rays, dim=0),
         rel_points_w.reshape(-1, 3),
-    ).view_as(rel_points_w)
+    ).view_as(rel_points_w)    # 앞쪽 hit point를 body frame으로 변환
 
     support_points_w = support_sensor.data.ray_hits_w
     support_finite = torch.isfinite(support_points_w).all(dim=-1)
@@ -309,81 +309,81 @@ def flipper_front_terrain_alignment_exp(
         support_finite.unsqueeze(-1),
         support_points_w,
         robot.data.root_pos_w.unsqueeze(1),
-    )
+    )   # invalid support hit 대체
     support_rel_points_w = safe_support_points_w - robot.data.root_pos_w.unsqueeze(1)
     num_support_rays = support_points_w.shape[1]
     support_points_b = math_utils.quat_apply_inverse(
         robot.data.root_quat_w.repeat_interleave(num_support_rays, dim=0),
         support_rel_points_w.reshape(-1, 3),
-    ).view_as(support_rel_points_w)
+    ).view_as(support_rel_points_w)     # support point를 body frame으로 변환
     support_count = support_finite.sum(dim=1).clamp_min(1)
     support_centroid_b = torch.where(
         support_finite.unsqueeze(-1),
         support_points_b,
         torch.zeros_like(support_points_b),
-    ).sum(dim=1) / support_count.unsqueeze(-1)
+    ).sum(dim=1) / support_count.unsqueeze(-1)   # support point 중심
     centered_support_points = torch.where(
         support_finite.unsqueeze(-1),
         support_points_b - support_centroid_b.unsqueeze(1),
         torch.zeros_like(support_points_b),
-    )
-    _, _, vh = torch.linalg.svd(centered_support_points)
+    )   # 평면 fitting을 위해 중심 기준으로 이동
+    _, _, vh = torch.linalg.svd(centered_support_points)       # support 지면 normal 계산
     support_normal_b = torch.nn.functional.normalize(vh[:, -1, :], dim=1)
-    support_normal_b = torch.where(support_normal_b[:, 2:3] < 0.0, -support_normal_b, support_normal_b)
+    support_normal_b = torch.where(support_normal_b[:, 2:3] < 0.0, -support_normal_b, support_normal_b)  # normal 방향 정리
 
     relative_height = torch.sum(
         (points_b - support_centroid_b.unsqueeze(1)) * support_normal_b.unsqueeze(1),
         dim=-1,
-    )
+    )   # support 평면 기준 앞쪽 지형 높이
     front_mask = (
         finite
         & (points_b[..., 0] >= x_range[0])
         & (points_b[..., 0] <= x_range[1])
         & (points_b[..., 1] >= y_range[0])
         & (points_b[..., 1] <= y_range[1])
-    )
-    terrain_angle = torch.atan2(relative_height, torch.clamp(points_b[..., 0], min=1.0e-3))
-    terrain_angle = torch.where(front_mask, terrain_angle, torch.full_like(terrain_angle, -pi))
-    target_ids = torch.argmax(terrain_angle, dim=1)
+    )   # 앞쪽 관심 영역
+    terrain_angle = torch.atan2(relative_height, torch.clamp(points_b[..., 0], min=1.0e-3))  # 지형 상승 각도
+    terrain_angle = torch.where(front_mask, terrain_angle, torch.full_like(terrain_angle, -pi))  # 영역 밖은 제외
+    target_ids = torch.argmax(terrain_angle, dim=1)    # 가장 가파른 앞쪽 지점 선택
     env_ids = torch.arange(env.num_envs, device=env.device)
 
-    target_x = points_b[env_ids, target_ids, 0]
-    target_z = relative_height[env_ids, target_ids]
+    target_x = points_b[env_ids, target_ids, 0]        # target 지점의 body x
+    target_z = relative_height[env_ids, target_ids]    # target 지점의 상대 높이
     terrain_vec_b = torch.stack(
         [
             target_x,
             torch.zeros_like(target_x),
             target_z,
         ],
-        dim=1,
+        dim=1,     # 앞 지형 방향 vector(x-z plane)
     )
-    has_target = front_mask.any(dim=1)
+    has_target = front_mask.any(dim=1)     # 앞쪽 영역에 유효 hit가 있는지
     terrain_vec_b = torch.where(
         has_target.unsqueeze(1),
         terrain_vec_b,
         torch.tensor([1.0, 0.0, 0.0], device=env.device).unsqueeze(0),
-    )
+    )   # target이 없으면 기본 전방 vector 사용
 
-    tip_pos_w = torch.mean(tip_frames.data.target_pos_w, dim=1)
-    flipper_vec_w = tip_pos_w - robot.data.root_pos_w
-    flipper_vec_b = math_utils.quat_apply_inverse(robot.data.root_quat_w, flipper_vec_w)
+    tip_pos_w = torch.mean(tip_frames.data.target_pos_w, dim=1)   # 좌우 flipper tip 평균 위치
+    flipper_vec_w = tip_pos_w - robot.data.root_pos_w             # robot root -> flipper tip vector
+    flipper_vec_b = math_utils.quat_apply_inverse(robot.data.root_quat_w, flipper_vec_w)  # body frame 변환
     flipper_vec_b = torch.stack(
         [
             flipper_vec_b[:, 0],
             torch.zeros_like(flipper_vec_b[:, 0]),
             flipper_vec_b[:, 2],
         ],
-        dim=1,
+        dim=1,     # flipper vector도 x-z plane만 사용
     )
 
-    terrain_len = torch.linalg.norm(terrain_vec_b, dim=1)
-    flipper_len = torch.linalg.norm(flipper_vec_b, dim=1)
-    valid = (terrain_len > min_vector_length) & (flipper_len > min_vector_length)
+    terrain_len = torch.linalg.norm(terrain_vec_b, dim=1)     # 지형 vector 길이
+    flipper_len = torch.linalg.norm(flipper_vec_b, dim=1)     # flipper vector 길이
+    valid = (terrain_len > min_vector_length) & (flipper_len > min_vector_length)  # 너무 짧으면 무효
     terrain_dir = torch.nn.functional.normalize(terrain_vec_b, dim=1)
     flipper_dir = torch.nn.functional.normalize(flipper_vec_b, dim=1)
-    alignment = torch.sum(terrain_dir * flipper_dir, dim=1).clamp(-1.0, 1.0)
-    angle_error = torch.acos(alignment)
-    reward = torch.exp(-torch.square(angle_error / std))
+    alignment = torch.sum(terrain_dir * flipper_dir, dim=1).clamp(-1.0, 1.0)  # 두 방향의 cosine 유사도
+    angle_error = torch.acos(alignment)    # 두 vector 사이 각도 오차
+    reward = torch.exp(-torch.square(angle_error / std))  # 각도 오차가 작을수록 큰 보상
     return torch.where(valid, reward, torch.zeros_like(reward))
 
 
@@ -458,58 +458,67 @@ def excessive_flat_orientation_l2(
 
 
 def local_height_grid(
-    env: ManagerBasedRLEnv,
-    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-    sensor_cfg: SceneEntityCfg = SceneEntityCfg("terrain_grid_scanner"),
-    support_sensor_cfg: SceneEntityCfg = SceneEntityCfg("support_scanner"),
-    top_k: int = 3,
+    env: ManagerBasedRLEnv,     # 객체
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),               # robot asset
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("terrain_grid_scanner"),        # local height grid용 scanner
+    support_sensor_cfg: SceneEntityCfg = SceneEntityCfg("support_scanner"),     # 기준 지면 높이 scanner
+    top_k: int = 3,     # 각 grid cell에서 높은 ray hit 몇 개를 평균낼지
 ) -> torch.Tensor:
     """Return top-k average terrain height per local grid cell, relative to support ground height."""
-    robot = env.scene[asset_cfg.name]
-    sensor = env.scene.sensors[sensor_cfg.name]
-    support_sensor = env.scene.sensors[support_sensor_cfg.name]
+    robot = env.scene[asset_cfg.name]                    # robot asset 가져옴
+    sensor = env.scene.sensors[sensor_cfg.name]          # terrain grid scanner
+    support_sensor = env.scene.sensors[support_sensor_cfg.name]  # support scanner
 
-    points_w = sensor.data.ray_hits_w
-    finite = torch.isfinite(points_w).all(dim=-1)
-    safe_points_w = torch.where(finite.unsqueeze(-1), points_w, robot.data.root_pos_w.unsqueeze(1))
-    rel_points_w = safe_points_w - robot.data.root_pos_w.unsqueeze(1)
+    points_w = sensor.data.ray_hits_w       # grid scanner hit point(world)
+    finite = torch.isfinite(points_w).all(dim=-1)    # 유효 hit인지
+    safe_points_w = torch.where(finite.unsqueeze(-1), points_w, robot.data.root_pos_w.unsqueeze(1))  # invalid hit 대체
+    rel_points_w = safe_points_w - robot.data.root_pos_w.unsqueeze(1)   # robot root 기준 상대좌표
     num_rays = points_w.shape[1]
     points_b = math_utils.quat_apply_inverse(
         robot.data.root_quat_w.repeat_interleave(num_rays, dim=0),
         rel_points_w.reshape(-1, 3),
-    ).view_as(rel_points_w)
+    ).view_as(rel_points_w)    # body frame으로 변환
 
     support_points_w = support_sensor.data.ray_hits_w
     support_finite = torch.isfinite(support_points_w).all(dim=-1)
-    support_count = support_finite.sum(dim=1).clamp_min(1)
+    support_count = support_finite.sum(dim=1).clamp_min(1)   # 유효 support hit 개수
     support_ground_z = torch.where(
         support_finite,
         support_points_w[..., 2],
         torch.zeros_like(support_points_w[..., 2]),
-    ).sum(dim=1) / support_count
+    ).sum(dim=1) / support_count      # 로봇 아래 평균 지면 높이
 
-    x_bins = ((0.0, 0.25), (0.25, 0.5), (0.5, 0.75), (0.75, 1.0))
+    x_bins = (
+        (0.0, 0.15),
+        (0.15, 0.3),
+        (0.3, 0.45),
+        (0.45, 0.6),
+        (0.6, 0.75),
+        (0.75, 0.9),
+        (0.9, 1.05),
+        (1.05, 1.2),
+    )
     y_bins = ((-0.5, -0.25), (-0.25, 0.0), (0.0, 0.25), (0.25, 0.5))
     cell_heights = []
-    for x_min, x_max in x_bins:
-        for y_min, y_max in y_bins:
+    for x_min, x_max in x_bins:       # 앞쪽 x방향 8칸
+        for y_min, y_max in y_bins:   # 좌우 y방향 4칸
             cell_mask = (
                 finite
                 & (points_b[..., 0] >= x_min)
                 & (points_b[..., 0] < x_max)
                 & (points_b[..., 1] >= y_min)
                 & (points_b[..., 1] < y_max)
-            )
+            )   # 해당 grid cell에 들어온 ray만 선택
             masked_z = torch.where(cell_mask, safe_points_w[..., 2], torch.full_like(points_w[..., 2], -1.0e6))
-            top_values = torch.topk(masked_z, k=min(top_k, masked_z.shape[1]), dim=1).values
-            top_valid = top_values > -1.0e5
+            top_values = torch.topk(masked_z, k=min(top_k, masked_z.shape[1]), dim=1).values  # cell 내 높은 hit top-k
+            top_valid = top_values > -1.0e5       # 실제 hit인지 확인
             top_count = top_valid.sum(dim=1).clamp_min(1)
             top_mean_z = torch.where(top_valid, top_values, torch.zeros_like(top_values)).sum(dim=1) / top_count
             has_hit = top_valid.any(dim=1)
-            relative_height = torch.where(has_hit, top_mean_z - support_ground_z, torch.zeros_like(top_mean_z))
-            cell_heights.append(torch.clamp(relative_height, -0.5, 1.0))
+            relative_height = torch.where(has_hit, top_mean_z - support_ground_z, torch.zeros_like(top_mean_z))  # 지면 기준 높이
+            cell_heights.append(torch.clamp(relative_height, -0.5, 1.0))  # observation 범위 제한
 
-    return torch.stack(cell_heights, dim=1)
+    return torch.stack(cell_heights, dim=1)  # 8x4=32차원 height grid
 
 
 def front_obstacle_features(
@@ -959,7 +968,7 @@ class ActionsCfg:
         joint_signs=[1.0, 1.0],
         wheel_base=0.5,
         wheel_radius=0.1,
-        lin_vel_p_gain=0.5,
+        lin_vel_p_gain=0.3,
         ang_vel_p_gain=0.3,
         max_lin_vel=0.5,
         max_ang_vel=0.8,
@@ -1030,7 +1039,7 @@ class CurriculumCfg:
 @configclass
 class CmdVelFlipperEnvCfg(ManagerBasedRLEnvCfg):
     decimation: int = 4
-    episode_length_s: float = 20.0
+    episode_length_s: float = 40.0
     viewer = ViewerCfg(
         eye=(-6.0, 0.0, 5.0),
         lookat=(0.0, 0.0, 0.0),

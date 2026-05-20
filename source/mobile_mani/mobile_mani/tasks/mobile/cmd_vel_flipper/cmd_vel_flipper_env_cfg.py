@@ -281,10 +281,12 @@ def flipper_front_terrain_alignment_exp(
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),             # robot asset
     front_sensor_cfg: SceneEntityCfg = SceneEntityCfg("height_scanner"),      # 앞쪽 지형 scanner
     tip_frame_cfg: SceneEntityCfg = SceneEntityCfg("flipper_tip_frames"),     # flipper tip frame sensor
-    x_range: tuple[float, float] = (0.65, 0.85),       # 정렬 target을 찾을 앞쪽 x범위
+    x_range: tuple[float, float] = (0.85, 0.1),       # 정렬 target을 찾을 앞쪽 x범위
     y_range: tuple[float, float] = (-0.45, 0.45),    # 정렬 target을 찾을 y범위
     top_k: int = 5,                      # 가장 가파른 front point 몇 개를 평균낼지
     front_joint_x: float = 0.237,        # base_link 기준 front flipper joint x 위치
+    target_z_offset: float = 0.08,       # 지형점보다 살짝 위를 target으로 잡아 바닥 찍힘 방지
+    min_target_z: float = 0.03,          # joint 기준 target z가 너무 낮아지는 것을 방지
     min_vector_length: float = 0.05,     # 너무 짧은 vector는 무효 처리
     std: float = 0.45,                   # 각도 오차 reward 민감도
 ) -> torch.Tensor:
@@ -349,16 +351,18 @@ def flipper_front_terrain_alignment_exp(
     has_target = top_valid.any(dim=1)                                    # 앞쪽 영역에 유효 target이 있는지
 
     # 6) front joint에서 top-k 대표 지형점까지의 terrain vector를 만든다.
-    #    y 성분은 버리고 x-z plane만 비교해서 좌우 위치 차이보다 앞/위 방향 정렬에 집중한다.
+    #    지형점 그대로를 target으로 쓰면 낮은 계단/바닥에서 플리퍼가 아래로 박히는 자세도 보상을 받을 수 있다.
+    #    그래서 지형 대표점보다 target_z_offset만큼 위를 보게 하고, joint 기준 z도 최소 min_target_z 이상으로 제한한다.
     terrain_vec_b = representative_point_b - joint_center_b              # joint -> 지형 대표점
+    terrain_target_z = torch.clamp(terrain_vec_b[:, 2] + target_z_offset, min=min_target_z)  # joint 기준 target 높이
     terrain_vec_b = torch.stack(
         [
             terrain_vec_b[:, 0],
             torch.zeros_like(terrain_vec_b[:, 0]),
-            terrain_vec_b[:, 2],
+            terrain_target_z,
         ],
         dim=1,
-    )   # terrain vector를 x-z plane으로 투영
+    )   # terrain vector를 x-z plane으로 투영하면서 아래 방향 target을 제거
     terrain_vec_b = torch.where(
         has_target.unsqueeze(1),
         terrain_vec_b,
@@ -1016,6 +1020,7 @@ class RewardsCfg:
     action_rate = RewTerm(func=clamped_action_rate_l2, weight=-0.02)
     action_l2 = RewTerm(func=clamped_action_l2, weight=-0.02)
     flipper_front_terrain_alignment = RewTerm(func=flipper_front_terrain_alignment_exp, weight=0.3)
+    termination = RewTerm(func=mdp.is_terminated, weight=-1.0)
 
 
 @configclass

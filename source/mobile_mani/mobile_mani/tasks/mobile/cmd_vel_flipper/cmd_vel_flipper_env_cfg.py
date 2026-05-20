@@ -281,18 +281,17 @@ def flipper_front_terrain_alignment_exp(
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),             # robot asset
     front_sensor_cfg: SceneEntityCfg = SceneEntityCfg("height_scanner"),      # 앞쪽 지형 scanner
     tip_frame_cfg: SceneEntityCfg = SceneEntityCfg("flipper_tip_frames"),     # flipper tip frame sensor
-    x_range: tuple[float, float] = (0.85, 1.0),       # 정렬 target을 찾을 앞쪽 x범위
-    y_range: tuple[float, float] = (-0.45, 0.45),    # 정렬 target을 찾을 y범위
-    top_k: int = 5,                      # 가장 가파른 front point 몇 개를 평균낼지
+    x_range: tuple[float, float] = (0.7, 0.9),       # 플리퍼가 따라갈 preview band의 앞쪽 x범위
+    y_range: tuple[float, float] = (-0.35, 0.35),    # 플리퍼가 따라갈 preview band의 좌우 y범위
     front_joint_x: float = 0.237,        # base_link 기준 front flipper joint x 위치
-    target_z_offset: float = 0.5,       # 지형점보다 살짝 위를 보게 해서 평지에서 바닥을 찍는 방향을 완화
+    target_z_offset: float = 0.15,       # 지형점보다 살짝 위를 보게 해서 평지에서 바닥을 찍는 방향을 완화
     min_vector_length: float = 0.05,     # 너무 짧은 vector는 무효 처리
     std: float = 0.45,                   # 각도 오차 reward 민감도
 ) -> torch.Tensor:
-    """앞 플리퍼 링크 방향이 앞쪽 지형 target 방향과 비슷해지도록 보상한다.
+    """앞 플리퍼 링크 방향이 일정 거리 앞 지형 preview 방향과 비슷해지도록 보상한다.
 
     두 vector를 robot body x-z plane에서 만든다.
-    1. terrain_vec_b: front flipper joint center -> 앞쪽 top-k 지형 대표점.
+    1. terrain_vec_b: front flipper joint center -> 일정 거리 앞 preview band의 대표 지형점.
     2. flipper_vec_b: front flipper joint center -> 앞쪽 flipper tip 평균 위치.
 
     두 vector 사이 각도가 작을수록 reward가 커진다.
@@ -318,38 +317,28 @@ def flipper_front_terrain_alignment_exp(
     joint_center_b = torch.zeros(env.num_envs, 3, device=env.device)  # body frame의 joint center
     joint_center_b[:, 0] = front_joint_x                             # base_link 기준 front joint x
 
-    # 3) 앞쪽 관심 영역만 남긴다.
-    #    여기서는 로봇 body frame 기준 x/y 범위만 사용하고, 현재 발밑 높이는 쓰지 않는다.
-    front_mask = (
+    # 3) 일정 거리 앞 preview band만 남긴다.
+    #    "가장 높은 점"을 고르면 상승에는 유리하지만, 하강에서는 낮은 지형을 target으로 잡기 어렵다.
+    #    그래서 x/y 범위 안의 대표 지형점을 그대로 따라가게 해서 위/평지/아래 지형을 모두 표현한다.
+    preview_mask = (
         finite
         & (points_b[..., 0] >= x_range[0])
         & (points_b[..., 0] <= x_range[1])
         & (points_b[..., 1] >= y_range[0])
         & (points_b[..., 1] <= y_range[1])
-    )   # 앞쪽 관심 영역
+    )   # preview band에 들어온 ray만 선택
 
-    # 4) 각 front point를 "front joint에서 그 지점까지의 각도"로 바꾼다.
-    #    z가 높고 x가 가까울수록 더 큰 각도가 나오므로, 플리퍼가 먼저 맞춰야 할 턱/계단을 고르기 좋다.
-    point_from_joint_b = points_b - joint_center_b.unsqueeze(1)        # joint -> 각 ray hit point
-    point_dx = torch.clamp(point_from_joint_b[..., 0], min=1.0e-3)     # joint보다 앞쪽으로 향하는 x거리
-    terrain_angle = torch.atan2(point_from_joint_b[..., 2], point_dx)  # joint 기준 지형 상승 각도
-    terrain_angle = torch.where(front_mask, terrain_angle, torch.full_like(terrain_angle, -pi))  # 영역 밖은 제외
-
-    # 5) 가장 큰 각도를 가진 point 하나만 쓰면 noise에 민감하므로 top-k point의 평균을 대표점으로 쓴다.
-    #    즉, 3D LiDAR/height scanner point cloud에서 앞쪽 턱의 상단 후보들을 모아 하나의 target으로 압축한다.
-    k = min(top_k, terrain_angle.shape[1])                              # ray 수보다 큰 top-k 방지
-    top_values, top_ids = torch.topk(terrain_angle, k=k, dim=1)          # 가장 가파른 point top-k
-    top_valid = top_values > (-pi + 1.0e-5)                              # 실제 front_mask 안에서 뽑힌 point인지
-    top_points_b = torch.gather(points_b, 1, top_ids.unsqueeze(-1).expand(-1, -1, 3))  # top-k point 좌표
-    top_count = top_valid.sum(dim=1).clamp_min(1)                        # 유효 top-k 개수
+    # 4) preview band 안의 point들을 평균내서 대표 지형점을 만든다.
+    #    높은 점만 뽑지 않기 때문에, 앞 지형이 계단 아래로 내려가면 대표점도 자연스럽게 아래로 이동한다.
+    preview_count = preview_mask.sum(dim=1).clamp_min(1)                 # 유효 preview point 개수
     representative_point_b = torch.where(
-        top_valid.unsqueeze(-1),
-        top_points_b,
-        torch.zeros_like(top_points_b),
-    ).sum(dim=1) / top_count.unsqueeze(-1)                               # top-k 지형 대표점
-    has_target = top_valid.any(dim=1)                                    # 앞쪽 영역에 유효 target이 있는지
+        preview_mask.unsqueeze(-1),
+        points_b,
+        torch.zeros_like(points_b),
+    ).sum(dim=1) / preview_count.unsqueeze(-1)                           # preview band 대표 지형점
+    has_target = preview_mask.any(dim=1)                                 # preview band에 유효 point가 있는지
 
-    # 6) front joint에서 top-k 대표 지형점보다 target_z_offset만큼 위를 향하는 terrain vector를 만든다.
+    # 5) front joint에서 preview 대표 지형점보다 target_z_offset만큼 위를 향하는 terrain vector를 만든다.
     #    평평한 지형 point는 joint보다 낮기 때문에 그대로 쓰면 플리퍼가 바닥을 찍는 방향도 보상을 받을 수 있다.
     #    offset만 더하고 clamp는 하지 않아서, 하강 지형의 아래 방향 정보는 완전히 지우지 않는다.
     terrain_vec_b = representative_point_b - joint_center_b              # joint -> 지형 대표점
@@ -367,7 +356,7 @@ def flipper_front_terrain_alignment_exp(
         torch.tensor([1.0, 0.0, 0.0], device=env.device).unsqueeze(0),
     )   # target이 없으면 기본 전방 vector 사용
 
-    # 7) front joint에서 앞 플리퍼 tip 평균 위치까지의 flipper vector를 만든다.
+    # 6) front joint에서 앞 플리퍼 tip 평균 위치까지의 flipper vector를 만든다.
     #    이렇게 해야 "플리퍼 링크 자체 방향"과 "지형 target 방향"을 같은 시작점에서 비교할 수 있다.
     tip_pos_w = torch.mean(tip_frames.data.target_pos_w, dim=1)   # 좌우 flipper tip 평균 위치
     tip_rel_pos_w = tip_pos_w - robot.data.root_pos_w             # robot root -> flipper tip 위치
@@ -382,7 +371,7 @@ def flipper_front_terrain_alignment_exp(
         dim=1,     # flipper vector도 x-z plane만 사용
     )
 
-    # 8) 두 vector가 충분히 길 때만 방향을 비교한다.
+    # 7) 두 vector가 충분히 길 때만 방향을 비교한다.
     #    짧은 vector를 normalize하면 노이즈가 커지기 때문에 무효 처리한다.
     terrain_len = torch.linalg.norm(terrain_vec_b, dim=1)     # 지형 vector 길이
     flipper_len = torch.linalg.norm(flipper_vec_b, dim=1)     # flipper vector 길이
@@ -390,7 +379,7 @@ def flipper_front_terrain_alignment_exp(
     terrain_dir = torch.nn.functional.normalize(terrain_vec_b, dim=1)
     flipper_dir = torch.nn.functional.normalize(flipper_vec_b, dim=1)
 
-    # 9) 두 방향의 각도 오차를 exponential reward로 변환한다.
+    # 8) 두 방향의 각도 오차를 exponential reward로 변환한다.
     #    완전히 같은 방향이면 reward가 1에 가깝고, 어긋날수록 0에 가까워진다.
     alignment = torch.sum(terrain_dir * flipper_dir, dim=1).clamp(-1.0, 1.0)  # 두 방향의 cosine 유사도
     angle_error = torch.acos(alignment)    # 두 vector 사이 각도 오차

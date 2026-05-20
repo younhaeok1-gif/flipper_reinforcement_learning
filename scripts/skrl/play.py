@@ -78,6 +78,11 @@ import os
 import random
 import time
 from collections import OrderedDict
+from pathlib import Path
+
+PROJECT_SOURCE_PATH = Path(__file__).resolve().parents[2] / "source" / "mobile_mani"
+if PROJECT_SOURCE_PATH.is_dir() and str(PROJECT_SOURCE_PATH) not in sys.path:
+    sys.path.insert(0, str(PROJECT_SOURCE_PATH))
 
 import gymnasium as gym
 import skrl
@@ -108,7 +113,11 @@ from isaaclab.envs import (
 from isaaclab.utils.dict import print_dict
 
 from isaaclab_rl.skrl import SkrlVecEnvWrapper
-from isaaclab_rl.utils.pretrained_checkpoint import get_published_pretrained_checkpoint
+
+try:
+    from isaaclab_rl.utils.pretrained_checkpoint import get_published_pretrained_checkpoint
+except ModuleNotFoundError:
+    from isaaclab.utils.pretrained_checkpoint import get_published_pretrained_checkpoint
 
 import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.utils import get_checkpoint_path

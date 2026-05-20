@@ -1003,8 +1003,6 @@ class RewardsCfg:
     action_rate = RewTerm(func=clamped_action_rate_l2, weight=-0.02)
     action_l2 = RewTerm(func=clamped_action_l2, weight=-0.02)
     flipper_front_terrain_alignment = RewTerm(func=flipper_front_terrain_alignment_exp, weight=0.3)
-    flipper_cruise_clearance = RewTerm(func=flipper_cruise_clearance_exp, weight=0.5)
-    termination = RewTerm(func=mdp.is_terminated, weight=-100.0)
 
 
 @configclass

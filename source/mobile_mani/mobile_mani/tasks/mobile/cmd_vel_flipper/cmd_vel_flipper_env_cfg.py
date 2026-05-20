@@ -280,21 +280,30 @@ def flipper_front_terrain_alignment_exp(
     env: ManagerBasedRLEnv,     # 객체
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),             # robot asset
     front_sensor_cfg: SceneEntityCfg = SceneEntityCfg("height_scanner"),      # 앞쪽 지형 scanner
-    support_sensor_cfg: SceneEntityCfg = SceneEntityCfg("support_scanner"),   # 로봇 아래 지면 scanner
     tip_frame_cfg: SceneEntityCfg = SceneEntityCfg("flipper_tip_frames"),     # flipper tip frame sensor
-    x_range: tuple[float, float] = (0.1, 1.0),       # 정렬 target을 찾을 앞쪽 x범위
+    x_range: tuple[float, float] = (0.65, 0.85),       # 정렬 target을 찾을 앞쪽 x범위
     y_range: tuple[float, float] = (-0.45, 0.45),    # 정렬 target을 찾을 y범위
+    top_k: int = 5,                      # 가장 가파른 front point 몇 개를 평균낼지
+    front_joint_x: float = 0.237,        # base_link 기준 front flipper joint x 위치
     min_vector_length: float = 0.05,     # 너무 짧은 vector는 무효 처리
     std: float = 0.45,                   # 각도 오차 reward 민감도
 ) -> torch.Tensor:
-    """Reward the front flipper vector aligning with the steepest front terrain vector."""
+    """앞 플리퍼 링크 방향이 앞쪽 지형 target 방향과 비슷해지도록 보상한다.
+
+    두 vector를 robot body x-z plane에서 만든다.
+    1. terrain_vec_b: front flipper joint center -> 앞쪽 top-k 지형 대표점.
+    2. flipper_vec_b: front flipper joint center -> 앞쪽 flipper tip 평균 위치.
+
+    두 vector 사이 각도가 작을수록 reward가 커진다.
+    """
     robot = env.scene[asset_cfg.name]                         # robot asset 가져옴
     front_sensor = env.scene.sensors[front_sensor_cfg.name]    # 앞쪽 ray sensor
-    support_sensor = env.scene.sensors[support_sensor_cfg.name]  # support ground sensor
     tip_frames = env.scene.sensors[tip_frame_cfg.name]         # flipper tip frame sensor
 
+    # 1) 앞쪽 ray hit point들을 robot body frame으로 변환한다.
+    #    이렇게 해야 "로봇 기준 앞쪽 x/y 범위"를 안정적으로 고를 수 있다.
     points_w = front_sensor.data.ray_hits_w    # 앞쪽 지형 hit point(world)
-    finite = torch.isfinite(points_w).all(dim=-1)
+    finite = torch.isfinite(points_w).all(dim=-1) #유효한 hit인지 검사하는 코드
     safe_points_w = torch.where(finite.unsqueeze(-1), points_w, robot.data.root_pos_w.unsqueeze(1))  # invalid hit 대체
     rel_points_w = safe_points_w - robot.data.root_pos_w.unsqueeze(1)   # root 기준 상대좌표
     num_rays = points_w.shape[1]
@@ -303,38 +312,13 @@ def flipper_front_terrain_alignment_exp(
         rel_points_w.reshape(-1, 3),
     ).view_as(rel_points_w)    # 앞쪽 hit point를 body frame으로 변환
 
-    support_points_w = support_sensor.data.ray_hits_w
-    support_finite = torch.isfinite(support_points_w).all(dim=-1)
-    safe_support_points_w = torch.where(
-        support_finite.unsqueeze(-1),
-        support_points_w,
-        robot.data.root_pos_w.unsqueeze(1),
-    )   # invalid support hit 대체
-    support_rel_points_w = safe_support_points_w - robot.data.root_pos_w.unsqueeze(1)
-    num_support_rays = support_points_w.shape[1]
-    support_points_b = math_utils.quat_apply_inverse(
-        robot.data.root_quat_w.repeat_interleave(num_support_rays, dim=0),
-        support_rel_points_w.reshape(-1, 3),
-    ).view_as(support_rel_points_w)     # support point를 body frame으로 변환
-    support_count = support_finite.sum(dim=1).clamp_min(1)
-    support_centroid_b = torch.where(
-        support_finite.unsqueeze(-1),
-        support_points_b,
-        torch.zeros_like(support_points_b),
-    ).sum(dim=1) / support_count.unsqueeze(-1)   # support point 중심
-    centered_support_points = torch.where(
-        support_finite.unsqueeze(-1),
-        support_points_b - support_centroid_b.unsqueeze(1),
-        torch.zeros_like(support_points_b),
-    )   # 평면 fitting을 위해 중심 기준으로 이동
-    _, _, vh = torch.linalg.svd(centered_support_points)       # support 지면 normal 계산
-    support_normal_b = torch.nn.functional.normalize(vh[:, -1, :], dim=1)
-    support_normal_b = torch.where(support_normal_b[:, 2:3] < 0.0, -support_normal_b, support_normal_b)  # normal 방향 정리
+    # 2) URDF의 front flipper joint origin을 기준점으로 둔다.
+    #    좌우 joint의 x 위치가 같으므로 y는 0으로 두고 중앙 joint처럼 사용한다.
+    joint_center_b = torch.zeros(env.num_envs, 3, device=env.device)  # body frame의 joint center
+    joint_center_b[:, 0] = front_joint_x                             # base_link 기준 front joint x
 
-    relative_height = torch.sum(
-        (points_b - support_centroid_b.unsqueeze(1)) * support_normal_b.unsqueeze(1),
-        dim=-1,
-    )   # support 평면 기준 앞쪽 지형 높이
+    # 3) 앞쪽 관심 영역만 남긴다.
+    #    여기서는 로봇 body frame 기준 x/y 범위만 사용하고, 현재 발밑 높이는 쓰지 않는다.
     front_mask = (
         finite
         & (points_b[..., 0] >= x_range[0])
@@ -342,31 +326,51 @@ def flipper_front_terrain_alignment_exp(
         & (points_b[..., 1] >= y_range[0])
         & (points_b[..., 1] <= y_range[1])
     )   # 앞쪽 관심 영역
-    terrain_angle = torch.atan2(relative_height, torch.clamp(points_b[..., 0], min=1.0e-3))  # 지형 상승 각도
-    terrain_angle = torch.where(front_mask, terrain_angle, torch.full_like(terrain_angle, -pi))  # 영역 밖은 제외
-    target_ids = torch.argmax(terrain_angle, dim=1)    # 가장 가파른 앞쪽 지점 선택
-    env_ids = torch.arange(env.num_envs, device=env.device)
 
-    target_x = points_b[env_ids, target_ids, 0]        # target 지점의 body x
-    target_z = relative_height[env_ids, target_ids]    # target 지점의 상대 높이
+    # 4) 각 front point를 "front joint에서 그 지점까지의 각도"로 바꾼다.
+    #    z가 높고 x가 가까울수록 더 큰 각도가 나오므로, 플리퍼가 먼저 맞춰야 할 턱/계단을 고르기 좋다.
+    point_from_joint_b = points_b - joint_center_b.unsqueeze(1)        # joint -> 각 ray hit point
+    point_dx = torch.clamp(point_from_joint_b[..., 0], min=1.0e-3)     # joint보다 앞쪽으로 향하는 x거리
+    terrain_angle = torch.atan2(point_from_joint_b[..., 2], point_dx)  # joint 기준 지형 상승 각도
+    terrain_angle = torch.where(front_mask, terrain_angle, torch.full_like(terrain_angle, -pi))  # 영역 밖은 제외
+
+    # 5) 가장 큰 각도를 가진 point 하나만 쓰면 noise에 민감하므로 top-k point의 평균을 대표점으로 쓴다.
+    #    즉, 3D LiDAR/height scanner point cloud에서 앞쪽 턱의 상단 후보들을 모아 하나의 target으로 압축한다.
+    k = min(top_k, terrain_angle.shape[1])                              # ray 수보다 큰 top-k 방지
+    top_values, top_ids = torch.topk(terrain_angle, k=k, dim=1)          # 가장 가파른 point top-k
+    top_valid = top_values > (-pi + 1.0e-5)                              # 실제 front_mask 안에서 뽑힌 point인지
+    top_points_b = torch.gather(points_b, 1, top_ids.unsqueeze(-1).expand(-1, -1, 3))  # top-k point 좌표
+    top_count = top_valid.sum(dim=1).clamp_min(1)                        # 유효 top-k 개수
+    representative_point_b = torch.where(
+        top_valid.unsqueeze(-1),
+        top_points_b,
+        torch.zeros_like(top_points_b),
+    ).sum(dim=1) / top_count.unsqueeze(-1)                               # top-k 지형 대표점
+    has_target = top_valid.any(dim=1)                                    # 앞쪽 영역에 유효 target이 있는지
+
+    # 6) front joint에서 top-k 대표 지형점까지의 terrain vector를 만든다.
+    #    y 성분은 버리고 x-z plane만 비교해서 좌우 위치 차이보다 앞/위 방향 정렬에 집중한다.
+    terrain_vec_b = representative_point_b - joint_center_b              # joint -> 지형 대표점
     terrain_vec_b = torch.stack(
         [
-            target_x,
-            torch.zeros_like(target_x),
-            target_z,
+            terrain_vec_b[:, 0],
+            torch.zeros_like(terrain_vec_b[:, 0]),
+            terrain_vec_b[:, 2],
         ],
-        dim=1,     # 앞 지형 방향 vector(x-z plane)
-    )
-    has_target = front_mask.any(dim=1)     # 앞쪽 영역에 유효 hit가 있는지
+        dim=1,
+    )   # terrain vector를 x-z plane으로 투영
     terrain_vec_b = torch.where(
         has_target.unsqueeze(1),
         terrain_vec_b,
         torch.tensor([1.0, 0.0, 0.0], device=env.device).unsqueeze(0),
     )   # target이 없으면 기본 전방 vector 사용
 
+    # 7) front joint에서 앞 플리퍼 tip 평균 위치까지의 flipper vector를 만든다.
+    #    이렇게 해야 "플리퍼 링크 자체 방향"과 "지형 target 방향"을 같은 시작점에서 비교할 수 있다.
     tip_pos_w = torch.mean(tip_frames.data.target_pos_w, dim=1)   # 좌우 flipper tip 평균 위치
-    flipper_vec_w = tip_pos_w - robot.data.root_pos_w             # robot root -> flipper tip vector
-    flipper_vec_b = math_utils.quat_apply_inverse(robot.data.root_quat_w, flipper_vec_w)  # body frame 변환
+    tip_rel_pos_w = tip_pos_w - robot.data.root_pos_w             # robot root -> flipper tip 위치
+    tip_pos_b = math_utils.quat_apply_inverse(robot.data.root_quat_w, tip_rel_pos_w)  # tip 위치를 body frame으로 변환
+    flipper_vec_b = tip_pos_b - joint_center_b                    # front joint -> flipper tip vector
     flipper_vec_b = torch.stack(
         [
             flipper_vec_b[:, 0],
@@ -376,11 +380,16 @@ def flipper_front_terrain_alignment_exp(
         dim=1,     # flipper vector도 x-z plane만 사용
     )
 
+    # 8) 두 vector가 충분히 길 때만 방향을 비교한다.
+    #    짧은 vector를 normalize하면 노이즈가 커지기 때문에 무효 처리한다.
     terrain_len = torch.linalg.norm(terrain_vec_b, dim=1)     # 지형 vector 길이
     flipper_len = torch.linalg.norm(flipper_vec_b, dim=1)     # flipper vector 길이
     valid = (terrain_len > min_vector_length) & (flipper_len > min_vector_length)  # 너무 짧으면 무효
     terrain_dir = torch.nn.functional.normalize(terrain_vec_b, dim=1)
     flipper_dir = torch.nn.functional.normalize(flipper_vec_b, dim=1)
+
+    # 9) 두 방향의 각도 오차를 exponential reward로 변환한다.
+    #    완전히 같은 방향이면 reward가 1에 가깝고, 어긋날수록 0에 가까워진다.
     alignment = torch.sum(terrain_dir * flipper_dir, dim=1).clamp(-1.0, 1.0)  # 두 방향의 cosine 유사도
     angle_error = torch.acos(alignment)    # 두 vector 사이 각도 오차
     reward = torch.exp(-torch.square(angle_error / std))  # 각도 오차가 작을수록 큰 보상
@@ -489,18 +498,22 @@ def local_height_grid(
     ).sum(dim=1) / support_count      # 로봇 아래 평균 지면 높이
 
     x_bins = (
-        (0.0, 0.15),
-        (0.15, 0.3),
-        (0.3, 0.45),
-        (0.45, 0.6),
-        (0.6, 0.75),
-        (0.75, 0.9),
-        (0.9, 1.05),
-        (1.05, 1.2),
+        (0.0, 0.1),
+        (0.1, 0.2),
+        (0.2, 0.3),
+        (0.3, 0.4),
+        (0.4, 0.5),
+        (0.5, 0.6),
+        (0.6, 0.7),
+        (0.7, 0.8),
+        (0.8, 0.9),
+        (0.9, 1.0),
+        (1.0, 1.1),
+        (1.1, 1.2),
     )
     y_bins = ((-0.5, -0.25), (-0.25, 0.0), (0.0, 0.25), (0.25, 0.5))
     cell_heights = []
-    for x_min, x_max in x_bins:       # 앞쪽 x방향 8칸
+    for x_min, x_max in x_bins:       # 앞쪽 x방향 12칸
         for y_min, y_max in y_bins:   # 좌우 y방향 4칸
             cell_mask = (
                 finite

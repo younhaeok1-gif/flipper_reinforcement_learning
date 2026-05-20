@@ -77,6 +77,7 @@ simulation_app = app_launcher.app
 import os
 import random
 import time
+from collections import OrderedDict
 
 import gymnasium as gym
 import skrl
@@ -114,6 +115,39 @@ from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
 import mobile_mani.tasks  # noqa: F401
+
+
+def _convert_legacy_net_checkpoint(resume_path: str) -> str:
+    """Convert old skrl checkpoints using ``net.*`` keys to current ``net_container.*`` keys."""
+    checkpoint = torch.load(resume_path, map_location="cpu")
+    if not isinstance(checkpoint, dict):
+        return resume_path
+
+    converted = False
+    for role in ("policy", "value"):
+        state_dict = checkpoint.get(role)
+        if not isinstance(state_dict, dict):
+            continue
+        has_legacy_net = any(key.startswith("net.") for key in state_dict.keys())
+        has_current_net = any(key.startswith("net_container.") for key in state_dict.keys())
+        if not has_legacy_net or has_current_net:
+            continue
+
+        checkpoint[role] = OrderedDict(
+            (f"net_container.{key[4:]}" if key.startswith("net.") else key, value)
+            for key, value in state_dict.items()
+        )
+        converted = True
+
+    if not converted:
+        return resume_path
+
+    root, ext = os.path.splitext(resume_path)
+    converted_path = f"{root}_net_container{ext}"
+    torch.save(checkpoint, converted_path)
+    print(f"[INFO] Converted legacy skrl checkpoint for current model keys: {converted_path}")
+    return converted_path
+
 
 # config shortcuts
 if args_cli.agent is None:
@@ -205,6 +239,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
     runner = Runner(env, experiment_cfg)
 
     print(f"[INFO] Loading model checkpoint from: {resume_path}")
+    resume_path = _convert_legacy_net_checkpoint(resume_path)
     runner.agent.load(resume_path)
     # set agent to evaluation mode
     runner.agent.set_running_mode("eval")

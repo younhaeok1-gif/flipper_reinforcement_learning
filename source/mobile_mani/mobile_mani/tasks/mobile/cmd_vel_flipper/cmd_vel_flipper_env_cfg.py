@@ -284,7 +284,7 @@ def flipper_front_terrain_alignment_exp(
     x_range: tuple[float, float] = (0.7, 0.9),       # 플리퍼가 따라갈 preview band의 앞쪽 x범위
     y_range: tuple[float, float] = (-0.35, 0.35),    # 플리퍼가 따라갈 preview band의 좌우 y범위
     front_joint_x: float = 0.237,        # base_link 기준 front flipper joint x 위치
-    target_z_offset: float = 0.15,       # 지형점보다 살짝 위를 보게 해서 평지에서 바닥을 찍는 방향을 완화
+    target_z_offset: float = 0.21,       # 지형점보다 살짝 위를 보게 해서 평지에서 바닥을 찍는 방향을 완화
     min_vector_length: float = 0.05,     # 너무 짧은 vector는 무효 처리
     std: float = 0.45,                   # 각도 오차 reward 민감도
 ) -> torch.Tensor:
@@ -328,14 +328,18 @@ def flipper_front_terrain_alignment_exp(
         & (points_b[..., 1] <= y_range[1])
     )   # preview band에 들어온 ray만 선택
 
-    # 4) preview band 안의 point들을 평균내서 대표 지형점을 만든다.
-    #    높은 점만 뽑지 않기 때문에, 앞 지형이 계단 아래로 내려가면 대표점도 자연스럽게 아래로 이동한다.
+    # 4) preview band 안의 point들에서 z 높이만 평균내서 대표 지형 높이를 만든다.
+    #    x까지 평균내면 ray hit 분포에 따라 target 거리가 흔들릴 수 있다.
+    #    그래서 x는 preview band 중앙값으로 고정하고, z만 지형 높이를 따라가게 만든다.
     preview_count = preview_mask.sum(dim=1).clamp_min(1)                 # 유효 preview point 개수
-    representative_point_b = torch.where(
-        preview_mask.unsqueeze(-1),
-        points_b,
-        torch.zeros_like(points_b),
-    ).sum(dim=1) / preview_count.unsqueeze(-1)                           # preview band 대표 지형점
+    representative_z_b = torch.where(
+        preview_mask,
+        points_b[..., 2],
+        torch.zeros_like(points_b[..., 2]),
+    ).sum(dim=1) / preview_count                                         # preview band 평균 지형 높이
+    representative_point_b = torch.zeros(env.num_envs, 3, device=env.device)  # preview band 대표 지형점
+    representative_point_b[:, 0] = 0.5 * (x_range[0] + x_range[1])        # target x는 preview band 중앙으로 고정
+    representative_point_b[:, 2] = representative_z_b                    # target z만 실제 지형 평균 높이를 사용
     has_target = preview_mask.any(dim=1)                                 # preview band에 유효 point가 있는지
 
     # 5) front joint에서 preview 대표 지형점보다 target_z_offset만큼 위를 향하는 terrain vector를 만든다.
@@ -593,7 +597,7 @@ def local_height_grid(
     support_sensor_cfg: SceneEntityCfg = SceneEntityCfg("support_scanner"),     # 기준 지면 높이 scanner
     top_k: int = 3,     # 각 grid cell에서 높은 ray hit 몇 개를 평균낼지
 ) -> torch.Tensor:
-    """Return top-k average terrain height per local grid cell, relative to support ground height."""
+    """Return top-k average terrain height per local grid cell in the robot body frame."""
     robot = env.scene[asset_cfg.name]                    # robot asset 가져옴
     sensor = env.scene.sensors[sensor_cfg.name]          # terrain grid scanner
     support_sensor = env.scene.sensors[support_sensor_cfg.name]  # support scanner
@@ -610,12 +614,23 @@ def local_height_grid(
 
     support_points_w = support_sensor.data.ray_hits_w
     support_finite = torch.isfinite(support_points_w).all(dim=-1)
+    safe_support_points_w = torch.where(
+        support_finite.unsqueeze(-1),
+        support_points_w,
+        robot.data.root_pos_w.unsqueeze(1),
+    )   # invalid support hit 대체
+    support_rel_points_w = safe_support_points_w - robot.data.root_pos_w.unsqueeze(1)  # robot root 기준 support 좌표
+    num_support_rays = support_points_w.shape[1]
+    support_points_b = math_utils.quat_apply_inverse(
+        robot.data.root_quat_w.repeat_interleave(num_support_rays, dim=0),
+        support_rel_points_w.reshape(-1, 3),
+    ).view_as(support_rel_points_w)    # support point를 body frame으로 변환
     support_count = support_finite.sum(dim=1).clamp_min(1)   # 유효 support hit 개수
-    support_ground_z = torch.where(
+    support_ground_z_b = torch.where(
         support_finite,
-        support_points_w[..., 2],
-        torch.zeros_like(support_points_w[..., 2]),
-    ).sum(dim=1) / support_count      # 로봇 아래 평균 지면 높이
+        support_points_b[..., 2],
+        torch.zeros_like(support_points_b[..., 2]),
+    ).sum(dim=1) / support_count      # body frame 기준 로봇 아래 평균 지면 높이
 
     x_bins = (
         (0.0, 0.1),
@@ -642,16 +657,20 @@ def local_height_grid(
                 & (points_b[..., 1] >= y_min)
                 & (points_b[..., 1] < y_max)
             )   # 해당 grid cell에 들어온 ray만 선택
-            masked_z = torch.where(cell_mask, safe_points_w[..., 2], torch.full_like(points_w[..., 2], -1.0e6))
-            top_values = torch.topk(masked_z, k=min(top_k, masked_z.shape[1]), dim=1).values  # cell 내 높은 hit top-k
+            masked_z_b = torch.where(cell_mask, points_b[..., 2], torch.full_like(points_b[..., 2], -1.0e6))
+            top_values = torch.topk(masked_z_b, k=min(top_k, masked_z_b.shape[1]), dim=1).values  # cell 내 body z top-k
             top_valid = top_values > -1.0e5       # 실제 hit인지 확인
             top_count = top_valid.sum(dim=1).clamp_min(1)
-            top_mean_z = torch.where(top_valid, top_values, torch.zeros_like(top_values)).sum(dim=1) / top_count
+            top_mean_z_b = torch.where(top_valid, top_values, torch.zeros_like(top_values)).sum(dim=1) / top_count
             has_hit = top_valid.any(dim=1)
-            relative_height = torch.where(has_hit, top_mean_z - support_ground_z, torch.zeros_like(top_mean_z))  # 지면 기준 높이
+            relative_height = torch.where(
+                has_hit,
+                top_mean_z_b - support_ground_z_b,
+                torch.zeros_like(top_mean_z_b),
+            )  # body frame에서 본 로봇 아래 지면 기준 상대 높이
             cell_heights.append(torch.clamp(relative_height, -0.5, 1.0))  # observation 범위 제한
 
-    return torch.stack(cell_heights, dim=1)  # 8x4=32차원 height grid
+    return torch.stack(cell_heights, dim=1)  # 12x4=48차원 height grid
 
 
 def front_obstacle_features(
@@ -1135,7 +1154,7 @@ class ObservationsCfg:
 class RewardsCfg:
     action_rate = RewTerm(func=clamped_action_rate_l2, weight=-0.02)
     action_l2 = RewTerm(func=clamped_action_l2, weight=-0.02)
-    flipper_front_terrain_alignment = RewTerm(func=flipper_front_terrain_alignment_exp, weight=0.3)
+    flipper_front_terrain_alignment = RewTerm(func=flipper_front_terrain_alignment_exp, weight=1.0)
     # flipper_front_terrain_alignment_old = RewTerm(func=flipper_support_plane_alignment_exp, weight=0.3)
     termination = RewTerm(func=mdp.is_terminated, weight=-1.0)
 

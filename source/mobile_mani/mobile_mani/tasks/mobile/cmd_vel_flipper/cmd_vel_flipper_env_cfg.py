@@ -400,6 +400,135 @@ def flipper_front_terrain_alignment_exp(
     return torch.where(valid, reward, torch.zeros_like(reward))
 
 
+def flipper_support_plane_alignment_exp(
+    env: ManagerBasedRLEnv,     # 객체
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),             # robot asset
+    front_sensor_cfg: SceneEntityCfg = SceneEntityCfg("height_scanner"),      # 앞쪽 지형 scanner
+    support_sensor_cfg: SceneEntityCfg = SceneEntityCfg("support_scanner"),   # 로봇 아래 지면 scanner
+    tip_frame_cfg: SceneEntityCfg = SceneEntityCfg("flipper_tip_frames"),     # flipper tip frame sensor
+    x_range: tuple[float, float] = (0.65, 0.85),       # 정렬 target을 찾을 앞쪽 x범위
+    y_range: tuple[float, float] = (-0.45, 0.45),      # 정렬 target을 찾을 y범위
+    min_vector_length: float = 0.05,                   # 너무 짧은 vector는 무효 처리
+    std: float = 0.45,                                 # 각도 오차 reward 민감도
+) -> torch.Tensor:
+    """support plane 기준으로 앞쪽 상승 지형을 찾고, flipper 방향과 정렬시키는 이전 구조 reward."""
+    robot = env.scene[asset_cfg.name]                         # robot asset 가져옴
+    front_sensor = env.scene.sensors[front_sensor_cfg.name]    # 앞쪽 ray sensor
+    support_sensor = env.scene.sensors[support_sensor_cfg.name]  # 로봇 아래쪽 ray sensor
+    tip_frames = env.scene.sensors[tip_frame_cfg.name]         # flipper tip frame sensor
+
+    # 1) 앞쪽 ray hit point들을 robot body frame으로 변환한다.
+    #    world 좌표 그대로 쓰면 로봇 yaw/pitch에 따라 앞쪽 범위 선택이 흔들리므로 body frame에서 처리한다.
+    points_w = front_sensor.data.ray_hits_w                    # 앞쪽 지형 hit point(world)
+    finite = torch.isfinite(points_w).all(dim=-1)              # 유효한 hit인지 확인
+    safe_points_w = torch.where(finite.unsqueeze(-1), points_w, robot.data.root_pos_w.unsqueeze(1))  # invalid hit 대체
+    rel_points_w = safe_points_w - robot.data.root_pos_w.unsqueeze(1)   # root 기준 상대좌표
+    num_rays = points_w.shape[1]                               # 앞쪽 scanner ray 개수
+    points_b = math_utils.quat_apply_inverse(
+        robot.data.root_quat_w.repeat_interleave(num_rays, dim=0),
+        rel_points_w.reshape(-1, 3),
+    ).view_as(rel_points_w)                                    # 앞쪽 hit point를 body frame으로 변환
+
+    # 2) support scanner point들로 로봇 아래 local ground plane을 추정한다.
+    #    이 plane은 "현재 발밑 지면" 기준이므로, 앞쪽 계단/턱이 얼마나 솟았는지 판단하는 기준이 된다.
+    support_points_w = support_sensor.data.ray_hits_w          # 로봇 아래쪽 지면 hit point(world)
+    support_finite = torch.isfinite(support_points_w).all(dim=-1)  # support hit 유효성
+    safe_support_points_w = torch.where(
+        support_finite.unsqueeze(-1),
+        support_points_w,
+        robot.data.root_pos_w.unsqueeze(1),
+    )                                                          # invalid support hit 대체
+    support_rel_points_w = safe_support_points_w - robot.data.root_pos_w.unsqueeze(1)  # root 기준 support 좌표
+    num_support_rays = support_points_w.shape[1]               # support scanner ray 개수
+    support_points_b = math_utils.quat_apply_inverse(
+        robot.data.root_quat_w.repeat_interleave(num_support_rays, dim=0),
+        support_rel_points_w.reshape(-1, 3),
+    ).view_as(support_rel_points_w)                            # support point를 body frame으로 변환
+    support_count = support_finite.sum(dim=1).clamp_min(1)     # 유효 support point 개수
+    support_centroid_b = torch.where(
+        support_finite.unsqueeze(-1),
+        support_points_b,
+        torch.zeros_like(support_points_b),
+    ).sum(dim=1) / support_count.unsqueeze(-1)                 # support point 중심
+    centered_support_points = torch.where(
+        support_finite.unsqueeze(-1),
+        support_points_b - support_centroid_b.unsqueeze(1),
+        torch.zeros_like(support_points_b),
+    )                                                          # plane fitting을 위해 중심 기준으로 이동
+    _, _, vh = torch.linalg.svd(centered_support_points)       # SVD로 support plane normal 계산
+    support_normal_b = torch.nn.functional.normalize(vh[:, -1, :], dim=1)  # 가장 작은 축이 plane normal
+    support_normal_b = torch.where(support_normal_b[:, 2:3] < 0.0, -support_normal_b, support_normal_b)  # normal 위쪽 정렬
+
+    # 3) 앞쪽 point들이 support plane보다 얼마나 높은지 계산한다.
+    #    바닥 point는 relative_height가 작고, 계단/턱 point는 relative_height가 커져 target으로 선택되기 쉽다.
+    relative_height = torch.sum(
+        (points_b - support_centroid_b.unsqueeze(1)) * support_normal_b.unsqueeze(1),
+        dim=-1,
+    )                                                          # support plane 기준 앞쪽 지형 높이
+    front_mask = (
+        finite
+        & (points_b[..., 0] >= x_range[0])
+        & (points_b[..., 0] <= x_range[1])
+        & (points_b[..., 1] >= y_range[0])
+        & (points_b[..., 1] <= y_range[1])
+    )                                                          # 앞쪽 관심 영역
+
+    # 4) support plane 기준으로 가장 가파르게 올라간 앞쪽 point를 target으로 고른다.
+    #    x가 가까우면서 relative_height가 높은 point일수록 큰 angle을 갖는다.
+    terrain_angle = torch.atan2(relative_height, torch.clamp(points_b[..., 0], min=1.0e-3))  # 지형 상승 각도
+    terrain_angle = torch.where(front_mask, terrain_angle, torch.full_like(terrain_angle, -pi))  # 영역 밖 제외
+    target_ids = torch.argmax(terrain_angle, dim=1)            # 가장 큰 상승 각도를 가진 point 선택
+    env_ids = torch.arange(env.num_envs, device=env.device)    # env index
+    has_target = front_mask.any(dim=1)                         # 앞쪽 영역에 유효 target이 있는지
+
+    # 5) robot root에서 target 지형까지의 terrain vector를 만든다.
+    #    이전 구조와 동일하게 root 기준 vector를 쓰고, x-z plane에서만 비교한다.
+    target_x = points_b[env_ids, target_ids, 0]                # target point body x
+    target_z = relative_height[env_ids, target_ids]            # support plane 기준 target 높이
+    terrain_vec_b = torch.stack(
+        [
+            target_x,
+            torch.zeros_like(target_x),
+            target_z,
+        ],
+        dim=1,
+    )                                                          # root -> 앞쪽 상승 지형 vector
+    terrain_vec_b = torch.where(
+        has_target.unsqueeze(1),
+        terrain_vec_b,
+        torch.tensor([1.0, 0.0, 0.0], device=env.device).unsqueeze(0),
+    )                                                          # target이 없으면 기본 전방 vector 사용
+
+    # 6) robot root에서 앞 플리퍼 tip 평균 위치까지의 flipper vector를 만든다.
+    #    이전 구조처럼 flipper tip이 root 기준 어느 방향에 있는지를 terrain vector와 비교한다.
+    tip_pos_w = torch.mean(tip_frames.data.target_pos_w, dim=1)   # 좌우 front flipper tip 평균 위치
+    flipper_vec_w = tip_pos_w - robot.data.root_pos_w             # root -> flipper tip vector(world)
+    flipper_vec_b = math_utils.quat_apply_inverse(robot.data.root_quat_w, flipper_vec_w)  # body frame 변환
+    flipper_vec_b = torch.stack(
+        [
+            flipper_vec_b[:, 0],
+            torch.zeros_like(flipper_vec_b[:, 0]),
+            flipper_vec_b[:, 2],
+        ],
+        dim=1,
+    )                                                          # flipper vector도 x-z plane만 사용
+
+    # 7) 두 vector가 충분히 길 때만 normalize해서 방향을 비교한다.
+    #    너무 짧은 vector는 작은 노이즈에도 방향이 크게 튀므로 reward를 0으로 둔다.
+    terrain_len = torch.linalg.norm(terrain_vec_b, dim=1)      # terrain vector 길이
+    flipper_len = torch.linalg.norm(flipper_vec_b, dim=1)      # flipper vector 길이
+    valid = (terrain_len > min_vector_length) & (flipper_len > min_vector_length)  # 방향 비교 가능 여부
+    terrain_dir = torch.nn.functional.normalize(terrain_vec_b, dim=1)  # terrain 방향 단위벡터
+    flipper_dir = torch.nn.functional.normalize(flipper_vec_b, dim=1)  # flipper 방향 단위벡터
+
+    # 8) 두 방향의 각도 오차를 exponential reward로 변환한다.
+    #    방향이 같으면 1에 가깝고, 각도가 벌어질수록 0에 가까워진다.
+    alignment = torch.sum(terrain_dir * flipper_dir, dim=1).clamp(-1.0, 1.0)  # cosine 유사도
+    angle_error = torch.acos(alignment)                        # 두 vector 사이 각도
+    reward = torch.exp(-torch.square(angle_error / std))       # 각도 오차 기반 reward
+    return torch.where(valid, reward, torch.zeros_like(reward)) # 무효한 경우 reward 0
+
+
 def excessive_pitch_l2(
     env: ManagerBasedRLEnv,
     deadband: float = 0.45,
@@ -1020,6 +1149,7 @@ class RewardsCfg:
     action_rate = RewTerm(func=clamped_action_rate_l2, weight=-0.02)
     action_l2 = RewTerm(func=clamped_action_l2, weight=-0.02)
     flipper_front_terrain_alignment = RewTerm(func=flipper_front_terrain_alignment_exp, weight=0.3)
+    # flipper_front_terrain_alignment_old = RewTerm(func=flipper_support_plane_alignment_exp, weight=0.3)
     termination = RewTerm(func=mdp.is_terminated, weight=-1.0)
 
 

@@ -744,8 +744,8 @@ class CmdVelFlipperSceneCfg(InteractiveSceneCfg):
         physics_material=sim_utils.RigidBodyMaterialCfg(
             friction_combine_mode="multiply",
             restitution_combine_mode="multiply",
-            static_friction=3.0,
-            dynamic_friction=3.0,
+            static_friction=10.0,
+            dynamic_friction=10.0,
         ),
         visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.45, 0.45, 0.45)),
         debug_vis=False,
@@ -968,8 +968,8 @@ class ActionsCfg:
         joint_signs=[1.0, 1.0],
         wheel_base=0.5,
         wheel_radius=0.1,
-        lin_vel_p_gain=0.3,
-        ang_vel_p_gain=0.3,
+        lin_vel_p_gain=0.0,
+        ang_vel_p_gain=0.0,
         max_lin_vel=0.5,
         max_ang_vel=0.8,
     )

@@ -283,8 +283,12 @@ def flipper_front_terrain_alignment_exp(
     tip_frame_cfg: SceneEntityCfg = SceneEntityCfg("flipper_tip_frames"),     # flipper tip frame sensor
     x_range: tuple[float, float] = (0.7, 0.9),       # 플리퍼가 따라갈 preview band의 앞쪽 x범위
     y_range: tuple[float, float] = (-0.35, 0.35),    # 플리퍼가 따라갈 preview band의 좌우 y범위
+    top_k: int = 3,                       # 올라가는 자세에서 높은 지형 대표값을 만들 때 쓸 point 개수
+    bottom_k: int = 3,                    # 내려가는 자세에서 낮은 지형 대표값을 만들 때 쓸 point 개수
     front_joint_x: float = 0.237,        # base_link 기준 front flipper joint x 위치
     target_z_offset: float = 0.21,       # 지형점보다 살짝 위를 보게 해서 평지에서 바닥을 찍는 방향을 완화
+    pitch_blend: float = 0.25,           # pitch가 이 값에 가까워질수록 mean 대신 top/bottom을 더 강하게 사용
+    pitch_sign: float = 1.0,             # 올라가는 자세에서 projected_gravity_b[:,0] 부호가 반대면 -1.0으로 변경
     min_vector_length: float = 0.05,     # 너무 짧은 vector는 무효 처리
     std: float = 0.45,                   # 각도 오차 reward 민감도
 ) -> torch.Tensor:
@@ -328,18 +332,50 @@ def flipper_front_terrain_alignment_exp(
         & (points_b[..., 1] <= y_range[1])
     )   # preview band에 들어온 ray만 선택
 
-    # 4) preview band 안의 point들에서 z 높이만 평균내서 대표 지형 높이를 만든다.
-    #    x까지 평균내면 ray hit 분포에 따라 target 거리가 흔들릴 수 있다.
-    #    그래서 x는 preview band 중앙값으로 고정하고, z만 지형 높이를 따라가게 만든다.
+    # 4) preview band 안의 point들에서 mean/top/bottom z를 각각 만든다.
+    #    평지나 자세가 중립이면 mean_z를 보고, 올라가는 자세이면 top_z를 더 보고,
+    #    내려가는 자세이면 bottom_z를 더 보도록 pitch에 따라 부드럽게 섞는다.
+    #    이렇게 하면 올라가는 중 계단의 움푹 들어간 낮은 point에 덜 속고,
+    #    내려가는 중에는 낮은 지형을 자연스럽게 따라갈 수 있다.
     preview_count = preview_mask.sum(dim=1).clamp_min(1)                 # 유효 preview point 개수
-    representative_z_b = torch.where(
+    preview_z_b = torch.where(
         preview_mask,
         points_b[..., 2],
         torch.zeros_like(points_b[..., 2]),
-    ).sum(dim=1) / preview_count                                         # preview band 평균 지형 높이
+    )
+    mean_z_b = preview_z_b.sum(dim=1) / preview_count                    # preview band 평균 지형 높이
+
+    masked_top_z_b = torch.where(
+        preview_mask,
+        points_b[..., 2],
+        torch.full_like(points_b[..., 2], -1.0e6),
+    )                                                                    # top-k 계산용 invalid 제거
+    top_values = torch.topk(masked_top_z_b, k=min(top_k, masked_top_z_b.shape[1]), dim=1).values
+    top_valid = top_values > -1.0e5                                      # 실제 top-k point인지 확인
+    top_count = top_valid.sum(dim=1).clamp_min(1)
+    top_z_b = torch.where(top_valid, top_values, torch.zeros_like(top_values)).sum(dim=1) / top_count
+
+    masked_bottom_z_b = torch.where(
+        preview_mask,
+        points_b[..., 2],
+        torch.full_like(points_b[..., 2], 1.0e6),
+    )                                                                    # bottom-k 계산용 invalid 제거
+    bottom_values = torch.topk(-masked_bottom_z_b, k=min(bottom_k, masked_bottom_z_b.shape[1]), dim=1).values
+    bottom_values = -bottom_values                                       # 가장 낮은 z값들을 다시 원래 부호로 복원
+    bottom_valid = bottom_values < 1.0e5                                 # 실제 bottom-k point인지 확인
+    bottom_count = bottom_valid.sum(dim=1).clamp_min(1)
+    bottom_z_b = torch.where(bottom_valid, bottom_values, torch.zeros_like(bottom_values)).sum(dim=1) / bottom_count
+
+    pitch_signal = pitch_sign * robot.data.projected_gravity_b[:, 0]     # 올라가는 자세를 + 방향으로 맞춘 pitch 신호
+    up_weight = torch.clamp(pitch_signal / pitch_blend, min=0.0, max=1.0)        # 올라갈수록 top_z 비중 증가
+    down_weight = torch.clamp(-pitch_signal / pitch_blend, min=0.0, max=1.0)     # 내려갈수록 bottom_z 비중 증가
+    high_blend_z_b = (1.0 - up_weight) * mean_z_b + up_weight * top_z_b          # mean -> top 부드러운 보간
+    low_blend_z_b = (1.0 - down_weight) * mean_z_b + down_weight * bottom_z_b    # mean -> bottom 부드러운 보간
+    representative_z_b = torch.where(pitch_signal >= 0.0, high_blend_z_b, low_blend_z_b)
+
     representative_point_b = torch.zeros(env.num_envs, 3, device=env.device)  # preview band 대표 지형점
     representative_point_b[:, 0] = 0.5 * (x_range[0] + x_range[1])        # target x는 preview band 중앙으로 고정
-    representative_point_b[:, 2] = representative_z_b                    # target z만 실제 지형 평균 높이를 사용
+    representative_point_b[:, 2] = representative_z_b                    # pitch에 따라 섞은 대표 z를 사용
     has_target = preview_mask.any(dim=1)                                 # preview band에 유효 point가 있는지
 
     # 5) front joint에서 preview 대표 지형점보다 target_z_offset만큼 위를 향하는 terrain vector를 만든다.
@@ -1152,7 +1188,7 @@ class ObservationsCfg:
 
 @configclass
 class RewardsCfg:
-    action_rate = RewTerm(func=clamped_action_rate_l2, weight=-0.02)
+    action_rate = RewTerm(func=clamped_action_rate_l2, weight=-0.04)
     action_l2 = RewTerm(func=clamped_action_l2, weight=-0.02)
     flipper_front_terrain_alignment = RewTerm(func=flipper_front_terrain_alignment_exp, weight=1.0)
     # flipper_front_terrain_alignment_old = RewTerm(func=flipper_support_plane_alignment_exp, weight=0.3)

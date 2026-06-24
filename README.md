@@ -8,6 +8,34 @@ It allows you to develop in an isolated environment, outside of the core Isaac L
 Project-specific notes for the current mobile flipper RL task are in
 [`docs/cmd_vel_flipper_task_notes.md`](docs/cmd_vel_flipper_task_notes.md).
 
+## Current Mobile Flipper Task
+
+The active task is `Template-Mobile-CmdVel-Flipper-v0`, implemented under
+`source/mobile_mani/mobile_mani/tasks/mobile/cmd_vel_flipper/`.
+
+Current focus:
+
+- Stair-centered terrain curriculum using `MeshPyramidStairsTerrainCfg`.
+- Fixed forward command velocity for stair experiments:
+  `command_lin_vel_range = (0.4, 0.4)` and `command_ang_vel_range = (0.0, 0.0)`.
+- Policy controls only the front flipper angle; track velocity is driven from
+  the sampled `cmd_vel`.
+- Terrain observation uses a dense local height grid from the ray scanners.
+- Main active reward shaping currently emphasizes:
+  - smooth/clamped flipper actions,
+  - front flipper alignment with a preview band of terrain ahead,
+  - pitch-rate penalty to reduce body pitching/jolting,
+  - termination penalty.
+
+Recent modeling notes:
+
+- A wheel contact count reward was tried and removed because it encouraged the
+  policy to keep the flippers raised instead of using them.
+- The front terrain alignment reward was adjusted to use robot/body-frame
+  terrain points, avoiding direct world-`z` height comparisons where possible.
+- `pitch_rate_l2` was added as a body pitch angular velocity penalty:
+  `robot.data.root_ang_vel_b[:, 1] ** 2`.
+
 **Key Features:**
 
 - `Isolation` Work outside the core Isaac Lab repository, ensuring that your development efforts remain self-contained.

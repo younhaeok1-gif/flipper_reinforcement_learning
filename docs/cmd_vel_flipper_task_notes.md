@@ -90,6 +90,7 @@ Current active rewards in `RewardsCfg`:
 - `action_l2`: negative action magnitude penalty using the clamped flipper action.
 - `flipper_front_terrain_alignment`: positive reward for aligning the front
   flipper vector with the steepest front terrain vector.
+- `pitch_rate`: negative penalty for fast body pitch angular velocity.
 - `flipper_cruise_clearance`: positive reward for keeping front flipper tips near
   target clearance during cruise/idle, only while the tip rollers are not in
   contact.

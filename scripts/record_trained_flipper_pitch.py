@@ -26,7 +26,7 @@ DEFAULT_CHECKPOINT = (
     / "logs"
     / "skrl"
     / "mobile_cmd_vel_flipper"
-    / "2026-05-21_00-16-29_ppo_torch_ppo_mlp_run"
+    / "2026-06-25_12-15-20_ppo_torch_ppo_mlp_run"
     / "checkpoints"
     / "best_agent.pt"
 )

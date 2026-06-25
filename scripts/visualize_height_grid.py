@@ -19,6 +19,7 @@ parser.add_argument("--task", type=str, default="Template-Mobile-CmdVel-Flipper-
 parser.add_argument("--num_envs", type=int, default=1, help="Number of environments. Use 1 for visualization.")
 parser.add_argument("--update_interval", type=int, default=5, help="Plot update interval in simulation steps.")
 parser.add_argument("--save_path", type=str, default=None, help="Optional path to save the latest heatmap PNG.")
+parser.add_argument("--follow_camera", action="store_true", default=False, help="Follow the robot with the viewer camera.")
 parser.add_argument("--disable_fabric", action="store_true", default=False, help="Disable fabric and use USD I/O.")
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
@@ -54,6 +55,11 @@ def main():
         use_fabric=not args_cli.disable_fabric,
     )
     env_cfg.scene.num_envs = 1
+    if not args_cli.follow_camera:
+        env_cfg.viewer.origin_type = "world"
+        env_cfg.viewer.asset_name = None
+        env_cfg.viewer.eye = (-6.0, -4.0, 3.0)
+        env_cfg.viewer.lookat = (-1.0, 0.0, 0.6)
 
     env = gym.make(args_cli.task, cfg=env_cfg)
     env.reset()

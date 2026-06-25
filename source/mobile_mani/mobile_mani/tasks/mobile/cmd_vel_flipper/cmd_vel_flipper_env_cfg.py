@@ -281,12 +281,12 @@ def flipper_front_terrain_alignment_exp(
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),             # robot asset
     front_sensor_cfg: SceneEntityCfg = SceneEntityCfg("height_scanner"),      # 앞쪽 지형 scanner
     tip_frame_cfg: SceneEntityCfg = SceneEntityCfg("flipper_tip_frames"),     # flipper tip frame sensor
-    x_range: tuple[float, float] = (0.7, 0.9),       # 플리퍼가 따라갈 preview band의 앞쪽 x범위
-    y_range: tuple[float, float] = (-0.35, 0.35),    # 플리퍼가 따라갈 preview band의 좌우 y범위
+    x_range: tuple[float, float] = (0.6, 1.0),       # 플리퍼가 따라갈 preview band의 앞쪽 x범위
+    y_range: tuple[float, float] = (-0.4, 0.4),      # 플리퍼가 따라갈 preview band의 좌우 y범위
     top_k: int = 3,                       # 올라가는 자세에서 높은 지형 대표값을 만들 때 쓸 point 개수
     bottom_k: int = 3,                    # unused: 이전 bottom-k 실험과 checkpoint 호환을 위해 남겨둠
     front_joint_x: float = 0.237,        # base_link 기준 front flipper joint x 위치
-    target_z_offset: float = 0.21,       # 지형점보다 살짝 위를 보게 해서 평지에서 바닥을 찍는 방향을 완화
+    target_z_offset: float = 0.30,       # 지형점보다 살짝 위를 보게 해서 평지에서 바닥을 찍는 방향을 완화
     pitch_blend: float = 0.25,           # pitch가 이 값에 가까워질수록 mean 대신 top/bottom을 더 강하게 사용
     pitch_sign: float = 1.0,             # 올라가는 자세에서 projected_gravity_b[:,0] 부호가 반대면 -1.0으로 변경
     min_vector_length: float = 0.05,     # 너무 짧은 vector는 무효 처리
@@ -332,8 +332,10 @@ def flipper_front_terrain_alignment_exp(
         & (points_b[..., 1] <= y_range[1])
     )   # preview band에 들어온 ray만 선택
 
-    # 4) preview band 안의 point들에서 mean/top z를 각각 만든다.
-    #    평지나 자세가 중립이면 mean_z를 보고, 올라가는 자세이면 top_z를 더 보고,
+    # 4) preview band 안의 point들에서 mean/top 대표값을 각각 만든다.
+    #    평지나 자세가 중립이면 mean_z를 보고, 올라가는 자세이면 top-k point를 더 본다.
+    #    top-k는 z만 쓰지 않고 x/z 좌표를 같이 평균내서, 높은 point의 실제 전방 거리도 보존한다.
+    #    y는 좌우 flipper를 평균 제어하므로 target에는 넣지 않고 0으로 고정한다.
     #    내려가는 자세에서도 낮은 틈(bottom)이 아니라 장애물/단차 상단(top)을 보도록 한다.
     #    이렇게 하면 올라가는 중 계단의 움푹 들어간 낮은 point에 덜 속고,
     #    내려가는 중에도 플리퍼가 바닥으로 과하게 박히는 target을 피할 수 있다.
@@ -350,17 +352,26 @@ def flipper_front_terrain_alignment_exp(
         points_b[..., 2],
         torch.full_like(points_b[..., 2], -1.0e6),
     )                                                                    # top-k 계산용 invalid 제거
-    top_values = torch.topk(masked_top_z_b, k=min(top_k, masked_top_z_b.shape[1]), dim=1).values
+    top_values, top_ids = torch.topk(masked_top_z_b, k=min(top_k, masked_top_z_b.shape[1]), dim=1)
     top_valid = top_values > -1.0e5                                      # 실제 top-k point인지 확인
     top_count = top_valid.sum(dim=1).clamp_min(1)
-    top_z_b = torch.where(top_valid, top_values, torch.zeros_like(top_values)).sum(dim=1) / top_count
+    top_points_b = torch.gather(points_b, 1, top_ids.unsqueeze(-1).expand(-1, -1, 3))  # top-k point의 실제 x/y/z 좌표
+    top_mean_point_b = torch.where(
+        top_valid.unsqueeze(-1),
+        top_points_b,
+        torch.zeros_like(top_points_b),
+    ).sum(dim=1) / top_count.unsqueeze(-1)                               # top-k point의 평균 위치
+    top_x_b = top_mean_point_b[:, 0]                                      # 높은 point들이 실제로 있는 전방 거리
+    top_z_b = top_mean_point_b[:, 2]                                      # 높은 point들의 평균 높이
 
     pitch_signal = pitch_sign * robot.data.projected_gravity_b[:, 0]     # 올라가는 자세를 + 방향으로 맞춘 pitch 신호
     top_weight = torch.clamp(torch.abs(pitch_signal) / pitch_blend, min=0.0, max=1.0)  # 기울수록 top_z 비중 증가
     representative_z_b = (1.0 - top_weight) * mean_z_b + top_weight * top_z_b          # mean -> top 부드러운 보간
+    preview_center_x_b = torch.full_like(top_x_b, 0.5 * (x_range[0] + x_range[1]))      # 중립 자세에서 볼 preview 중앙 x
+    representative_x_b = (1.0 - top_weight) * preview_center_x_b + top_weight * top_x_b # 중립은 중앙, 기울면 top-k 실제 x
 
     representative_point_b = torch.zeros(env.num_envs, 3, device=env.device)  # preview band 대표 지형점
-    representative_point_b[:, 0] = 0.5 * (x_range[0] + x_range[1])        # target x는 preview band 중앙으로 고정
+    representative_point_b[:, 0] = representative_x_b                    # target x는 top-k 실제 거리와 중앙값을 부드럽게 섞음
     representative_point_b[:, 2] = representative_z_b                    # mean/top을 섞은 대표 z를 사용
     has_target = preview_mask.any(dim=1)                                 # preview band에 유효 point가 있는지
 
@@ -1171,7 +1182,7 @@ class ObservationsCfg:
 
 @configclass
 class RewardsCfg:
-    action_rate = RewTerm(func=clamped_action_rate_l2, weight=-0.04)
+    action_rate = RewTerm(func=clamped_action_rate_l2, weight=-0.06)
     action_l2 = RewTerm(func=clamped_action_l2, weight=-0.02)
     flipper_front_terrain_alignment = RewTerm(func=flipper_front_terrain_alignment_exp, weight=1.0)
     pitch_rate = RewTerm(func=pitch_rate_l2, weight=-0.1)
